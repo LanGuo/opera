@@ -1,0 +1,22 @@
+# Virtual environments
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# Build artifacts
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Test cache
+.pytest_cache/
+
+# Eval run artifacts (can be large; host separately)
+runs/

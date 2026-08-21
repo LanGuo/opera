@@ -1,0 +1,64 @@
+task_id: protein_synergy_discovery
+goal: >
+  Investigate the synergistic (non-additive) effects of double mutations in the
+  protein GB1 (or similar fitness landscape datasets). Determine if synergy
+  is primarily driven by proximity to the active site or by physical distance
+  between the two mutation sites. The agent must discover and use a public
+  fitness landscape dataset (e.g., from ToolUniverse, GitHub, or academic repositories).
+termination_criteria:
+  min_variations_explored: 3
+  journal_entries_count: 5
+  reproducible_validation_script: true
+  max_tool_calls: 150
+evaluator:
+  model: claude-opus-4-7
+  max_turns: 200
+rubric:
+  - id: hypothesis_novelty
+    label: "Hypothesis Novelty"
+    scope: per_hypothesis
+    scale: "1-5"
+    guidance: >
+      Is the proposed synergy driver (proximity to active site vs. physical distance)
+      a well-known result or a finding that adds new understanding from this specific
+      dataset analysis?
+  - id: evidence_strength
+    label: "Evidence Strength"
+    scope: per_hypothesis
+    scale: "1-5"
+    guidance: >
+      Quality of evidence for the synergy hypothesis — appropriate statistical methods,
+      adequate sample size from the fitness landscape, and reproducibility of the
+      key finding.
+  - id: visualization_correctness
+    label: "Visualization Correctness"
+    scope: overall
+    scale: "1-5"
+    guidance: >
+      Check if activity heatmaps use sequential color scales and divergent scales
+      only for relative changes (delta, synergy scores). Using a divergent scale
+      on raw fitness [0,1] data is a scoring error.
+  - id: interview_quality
+    label: "Interview / Context-Loading Quality"
+    scope: overall
+    scale: "1-5"
+    guidance: >
+      Did the agent ask at least 2 clarifying questions about the data schema or
+      biological active site before performing analysis? This tests whether the
+      agent loads context before diving in.
+  - id: dataset_discovery
+    label: "Dataset Discovery"
+    scope: overall
+    scale: "yes/no/partial"
+    guidance: >
+      Did the agent autonomously find and cite a relevant protein fitness landscape
+      dataset (e.g., GB1, GFP, or similar deep mutational scanning data) without
+      being told which one to use?
+  - id: overall_quality
+    label: "Overall Scientific Quality"
+    scope: overall
+    scale: "1-5"
+    guidance: >
+      Scientific rigor of the analysis including reproducibility (standalone script),
+      appropriate statistical methods, depth of exploration across at least 3
+      distinct visualization approaches, and journal quality.

@@ -1,0 +1,27 @@
+{
+  "mcpServers": {
+    "hypothesis-ledger": {
+      "command": "uv",
+      "args": [
+        "run",
+        "python",
+        "-m",
+        "hypothesis_ledger.server"
+      ],
+      "env": {
+        "ALLOW_HUMAN_INPUT": "false"
+      },
+      "trust": true
+    },
+    "tooluniverse": {
+      "command": "uvx",
+      "args": [
+        "tooluniverse"
+      ],
+      "env": {
+        "PYTHONIOENCODING": "utf-8"
+      },
+      "trust": true
+    }
+  }
+}

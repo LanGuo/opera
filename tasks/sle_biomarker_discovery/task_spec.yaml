@@ -1,0 +1,68 @@
+task_id: sle_biomarker_discovery
+goal: >
+  Identify the top 3 cell-type-specific candidate biomarkers or therapeutic targets
+  for systemic lupus erythematosus (SLE / lupus), supported by multi-modal evidence.
+  Starting data: Perez et al. 2022 SLE PBMC cohort, accessible via the cellxgene_census
+  Python package (dataset ID: perez_2022, approximately 1.2 million cells, 162 donors —
+  SLE patients and healthy controls). The agent may discover and use additional datasets.
+termination_criteria:
+  min_hypotheses_with_multimodal_evidence: 3
+  max_tool_calls: 200
+evaluator:
+  model: claude-opus-4-7
+  max_turns: 250
+rubric:
+  - id: novelty
+    label: "Scientific Novelty"
+    scope: per_hypothesis
+    scale: "1-5"
+    guidance: >
+      Is this gene/cell-type combination a well-known SLE association or genuinely novel?
+      Does multi-modal evidence (DEG, GWAS, protein interaction, literature) strengthen
+      the claim beyond what is already established?
+  - id: experimental_design
+    label: "Experimental Design Quality"
+    scope: per_hypothesis
+    scale: "1-5"
+    guidance: >
+      Feasibility of proposed validation (realistic cell numbers, reagents, assays),
+      specificity to the hypothesis, statistical power (cohort size and controls),
+      and translatability to clinical use.
+  - id: evidence_strength
+    label: "Evidence Strength"
+    scope: per_hypothesis
+    scale: "1-5"
+    guidance: >
+      Quality and independence of evidence modalities. Are at least 2 independent
+      sources (scRNA-seq DEG, GWAS, protein interaction, literature, drug database)
+      supporting the hypothesis with quantified effect sizes?
+  - id: clinical_relevance
+    label: "Clinical/Translational Relevance"
+    scope: per_hypothesis
+    scale: "1-5"
+    guidance: >
+      Potential clinical impact if validated — relevant to SLE diagnosis, disease
+      monitoring, or treatment. Is the target druggable or measurable in clinical
+      samples?
+  - id: reasoning_quality
+    label: "Reasoning Quality"
+    scope: overall
+    scale: "1-5"
+    guidance: >
+      Did the agent update beliefs appropriately on evidence, handle contradictory
+      findings, and seek diverse modalities rather than cherry-picking confirming
+      evidence? Were refutations justified?
+  - id: overall_quality
+    label: "Overall Scientific Quality"
+    scope: overall
+    scale: "1-5"
+    guidance: >
+      Overall scientific rigor and quality of the discovery run — appropriate
+      statistical methods, multi-modal evidence integration, and depth of exploration.
+  - id: wet_lab_worthy
+    label: "Worth Pursuing in Wet Lab"
+    scope: overall
+    scale: "yes/no/partial"
+    guidance: >
+      Would the top hypotheses be worth pursuing in a wet lab validation study?
+      Consider feasibility, novelty, and clinical relevance together.
