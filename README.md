@@ -269,3 +269,7 @@ docker run --rm \
 2. Write `tasks/<task_id>/agent_task.md` — include goal, required agent behaviors (ledger maintenance, logging, multi-modal evidence), and termination criteria. See `tasks/sle_biomarker_discovery/agent_task.md` as reference.
 
 3. Launch: `./scripts/run_eval.sh <model> <max_turns> <task_id>`
+
+## License
+
+MIT — see [LICENSE](LICENSE).
