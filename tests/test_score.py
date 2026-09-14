@@ -342,6 +342,59 @@ Score: 3/5
     assert result[1].score == "3/5"
 
 
+def test_parse_markdown_bold_score_line():
+    raw = """\
+1. Novelty
+This gene has not been previously reported. Multi-modal evidence strengthens the claim.
+**Score: 4/5**
+
+2. Feasibility
+Standard FACS protocols apply. Cohort sizes are realistic.
+**Score:** 3/5
+"""
+    result = _parse_criterion_scores(raw, RUBRIC_2)
+    assert len(result) == 2
+    assert result[0].score == "4/5"
+    assert result[1].score == "3/5"
+
+
+def test_parse_markdown_header_numbered_blocks():
+    raw = """\
+## 1. Novelty
+This gene has not been previously reported. Evidence is strong.
+Score: 4/5
+
+## 2. Feasibility
+Standard FACS protocols apply. Reagents available.
+Score: 3/5
+"""
+    result = _parse_criterion_scores(raw, RUBRIC_2)
+    assert len(result) == 2
+    assert result[0].criterion_id == "novelty"
+    assert result[0].score == "4/5"
+    assert "not been previously reported" in result[0].rationale
+    assert result[1].criterion_id == "feasibility"
+    assert result[1].score == "3/5"
+
+
+def test_parse_markdown_agent_note_header():
+    raw = """\
+1. Novelty
+Strong evidence from three independent modalities. Largely agrees with prior literature.
+Score: 3/5
+**Agent self-assessment note:** Agree with human reviewer; slight underestimation possible.
+
+2. Feasibility
+Standard protocols apply here. Cohort is accessible.
+Score: 4/5
+"""
+    result = _parse_criterion_scores(raw, RUBRIC_2)
+    assert len(result) == 2
+    assert result[0].score == "3/5"
+    assert "Agree with human reviewer" in result[0].agent_note
+    assert result[1].agent_note == ""
+
+
 def test_parse_missing_score_line_returns_partial():
     raw = """\
 1. Novelty

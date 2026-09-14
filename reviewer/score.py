@@ -205,18 +205,26 @@ def _parse_criterion_scores(raw: str, rubric_items: list) -> list[CriterionScore
     if not raw or not rubric_items:
         return []
 
+    # Markdown formatting the model may wrap around structural markers (bold, headers).
+    # Tolerated on both sides of "Score:" / "Agent self-assessment note:" / numbered
+    # headings, since judge models inconsistently emit "**Score: 4/5**", "## 1. Novelty",
+    # "**Score:** 4/5", etc. instead of the plain text the prompt asked for.
+    # Deliberately excludes \n -- matching across newlines here would bridge the blank
+    # line between blocks and corrupt the block-split boundaries.
+    _MD = r'[#*]{0,4}[ \t]{0,3}'
+
     try:
-        # Split on numbered headings (e.g. "1. " or "2. ") or double newlines
-        # Try numbered heading split first
-        blocks = re.split(r'\n(?=\d+\.\s)', raw.strip())
+        # Split on numbered headings (e.g. "1. " or "2. ", optionally markdown-wrapped)
+        # or double newlines. Try numbered heading split first.
+        blocks = re.split(r'\n(?=' + _MD + r'\d+\.\s)', raw.strip())
         if len(blocks) < 2:
             # Fall back to double-newline split
             blocks = [b.strip() for b in re.split(r'\n\n+', raw.strip()) if b.strip()]
         else:
             # Fix 1: drop preamble block if block 0 doesn't look like a criterion block
             # (i.e. doesn't start with a digit and has no Score: line)
-            if blocks and not re.match(r'^\d+\.', blocks[0].strip()) and not re.search(
-                r'(?:^|\n)Score:\s*', blocks[0], re.IGNORECASE | re.MULTILINE
+            if blocks and not re.match(r'^' + _MD + r'\d+\.', blocks[0].strip()) and not re.search(
+                r'(?:^|\n)' + _MD + r'Score:', blocks[0], re.IGNORECASE | re.MULTILINE
             ):
                 blocks = blocks[1:]
 
@@ -233,15 +241,16 @@ def _parse_criterion_scores(raw: str, rubric_items: list) -> list[CriterionScore
             # Extract agent note if present
             agent_note = ""
             note_match = re.search(
-                r'Agent self-assessment note:\s*(.+?)(?:\n|$)', block, re.IGNORECASE | re.DOTALL
+                _MD + r'Agent self-assessment note:' + _MD + r'(.+?)(?:\n|$)',
+                block, re.IGNORECASE | re.DOTALL,
             )
             if note_match:
-                agent_note = note_match.group(1).strip()
+                agent_note = note_match.group(1).strip(' *#')
                 block = block[:note_match.start()].strip()
 
             # Fix 3: anchor Score regex to line start to avoid matching "Novelty Score:" mid-rationale
             score_match = re.search(
-                r'(?:^|\n)Score:\s*([^\n]+)', block, re.IGNORECASE | re.MULTILINE
+                r'(?:^|\n)' + _MD + r'Score:' + _MD + r'([^\n]+)', block, re.IGNORECASE | re.MULTILINE
             )
             # Fix 2: emit partial result instead of returning [] on missing Score line
             if not score_match:
@@ -253,10 +262,10 @@ def _parse_criterion_scores(raw: str, rubric_items: list) -> list[CriterionScore
                 ))
                 continue
 
-            score_val = score_match.group(1).strip()
+            score_val = score_match.group(1).strip().strip(' *#')
             rationale = block[:score_match.start()].strip()
-            # Remove leading numbered heading from rationale
-            rationale = re.sub(r'^\d+\.\s+[^\n]*\n', '', rationale).strip()
+            # Remove leading numbered heading (optionally markdown-wrapped) from rationale
+            rationale = re.sub(r'^' + _MD + r'\d+\.\s+[^\n]*\n', '', rationale).strip()
 
             result.append(CriterionScore(
                 criterion_id=item.get("id", f"criterion_{i}"),
