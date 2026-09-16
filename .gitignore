@@ -24,3 +24,8 @@ build/
 
 # Eval run artifacts (can be large; host separately)
 runs/
+
+# Symlink to the private repo's internal docs (decisions log, research notes,
+# bug logs) -- kept accessible here for convenience while working in this
+# directory, but must never be tracked or pushed to the public repo.
+docs-private
