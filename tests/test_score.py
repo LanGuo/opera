@@ -2,7 +2,11 @@ import pytest
 from unittest.mock import patch
 from hypothesis_ledger.workspace import Workspace
 from reviewer.llm import MockLLMClient
-from reviewer.score import score_run, score_run_all_backends, RunScores, _parse_criterion_scores, CriterionScore
+from reviewer.score import (
+    score_run, score_run_all_backends, RunScores, _parse_json_criteria,
+    _parse_json_agent_notes, _evidence_text, _format_evidence_trail,
+    _format_refuted_hypotheses, CriterionScore,
+)
 
 MOCK_RESPONSE = "Score: 4/5\nOverall score: 16/20"
 
@@ -67,6 +71,77 @@ def test_score_run_novelty_prompt_contains_cell_type(completed_run):
     score_run(completed_run, client=mock_llm)
     all_content = " ".join(m["content"] for call in mock_llm.calls for m in call)
     assert "plasmacytoid" in all_content
+
+
+# ----- string-format evidence tests -----
+# Gemini agents store evidence items as plain strings; Claude agents store dicts.
+# Regression coverage for a real crash: score_run_all_backends silently swallowed
+# 'str' object has no attribute 'get' for every backend on a Gemini-authored run,
+# because _format_evidence_trail / _format_refuted_hypotheses assumed dicts.
+
+def test_evidence_text_handles_string_item():
+    assert _evidence_text("Upregulated in SLE monocytes") == ("unknown", "Upregulated in SLE monocytes")
+
+
+def test_evidence_text_handles_dict_item():
+    assert _evidence_text({"type": "scRNA-seq", "description": "DEG in monocytes"}) == (
+        "scRNA-seq", "DEG in monocytes",
+    )
+
+
+def test_format_evidence_trail_handles_string_evidence():
+    update_history = [{
+        "changes": {
+            "from": {"evidence": []},
+            "to": {"evidence": ["Upregulated in SLE B cells (scRNA-seq)"]},
+        },
+    }]
+    result = _format_evidence_trail(update_history)
+    assert "Upregulated in SLE B cells" in result
+
+
+def test_format_refuted_hypotheses_handles_string_evidence():
+    all_hypotheses = {
+        "H1": {
+            "status": "refuted", "candidate_gene": "GENE1", "cell_type": "B cell",
+            "evidence": ["No association found in follow-up cohort"],
+        },
+    }
+    result = _format_refuted_hypotheses(all_hypotheses)
+    assert "No association found" in result
+
+
+def test_score_run_with_string_evidence_does_not_crash(tmp_path):
+    """End-to-end: a Gemini-style run (string evidence items) must not crash score_run."""
+    ws = Workspace(str(tmp_path / "gemini_style_run"))
+    ws.write_final_report({
+        "completed_at": "2026-01-01T00:00:00+00:00",
+        "top_hypotheses": [
+            {
+                "hypothesis_id": "H001",
+                "cell_type": "B cell",
+                "candidate_gene": "IFI44L",
+                "claim": "Upregulated in SLE B cells",
+                "evidence": ["Upregulated in B cells of SLE patients (scRNA-seq)"],
+                "confidence": 0.8,
+                "open_questions": [],
+                "status": "terminal",
+                "update_history": [{
+                    "rationale": "Literature support found",
+                    "changes": {
+                        "from": {"evidence": []},
+                        "to": {"evidence": ["Upregulated in B cells of SLE patients (scRNA-seq)"]},
+                    },
+                }],
+            }
+        ],
+        "suggested_validation": "Flow cytometry validation",
+        "total_tool_calls": 12,
+        "total_hypotheses_explored": 3,
+    })
+    mock_llm = MockLLMClient(WELL_FORMED_JSON)
+    scores = score_run(str(tmp_path / "gemini_style_run"), client=mock_llm)
+    assert len(scores.hypothesis_scores) == 1
 
 
 def test_score_run_no_report_raises(tmp_path):
@@ -230,6 +305,47 @@ def completed_run_with_spec(tmp_path):
     return str(tmp_path / "run_with_spec")
 
 
+@pytest.fixture
+def completed_run_with_spec_and_rationale(tmp_path):
+    """Like completed_run_with_spec, but with a non-empty update_history rationale
+    (triggers pass-2) and a two-item per_hypothesis rubric matching RUBRIC_2's ids,
+    with no overall-scope items (keeps call count to exactly pass-1 + pass-2)."""
+    import yaml
+    ws = Workspace(str(tmp_path / "run_with_rationale"))
+    ws.write_final_report({
+        "completed_at": "2026-01-01T00:00:00+00:00",
+        "top_hypotheses": [
+            {
+                "hypothesis_id": "H001",
+                "cell_type": "pDC",
+                "candidate_gene": "SIGLEC1",
+                "claim": "Upregulated in SLE pDCs",
+                "evidence": [{"source": "DEG_analysis", "strength": "strong"}],
+                "confidence": 0.8,
+                "open_questions": [],
+                "status": "terminal",
+                "update_history": [{"rationale": "GWAS hit raised confidence"}],
+            }
+        ],
+        "suggested_validation": "FACS sort pDCs",
+        "total_tool_calls": 42,
+        "total_hypotheses_explored": 3,
+    })
+    spec = {
+        "task_id": "test_task",
+        "goal": "Find biomarkers for disease X.",
+        "termination_criteria": {"max_tool_calls": 50},
+        "rubric": [
+            {"id": "novelty", "label": "Novelty", "scope": "per_hypothesis",
+             "scale": "1-5", "guidance": "Is it novel?"},
+            {"id": "feasibility", "label": "Feasibility", "scope": "per_hypothesis",
+             "scale": "1-5", "guidance": "Is it feasible?"},
+        ],
+    }
+    ws.task_spec_path.write_text(yaml.dump(spec), encoding="utf-8")
+    return str(tmp_path / "run_with_rationale")
+
+
 def test_score_run_with_task_spec_uses_goal_in_prompt(completed_run_with_spec):
     mock_llm = MockLLMClient(MOCK_RESPONSE)
     scores = score_run(completed_run_with_spec, client=mock_llm)
@@ -250,26 +366,23 @@ def test_score_run_with_task_spec_overall_raw_populated(completed_run_with_spec)
     assert "Quality score response" in scores.overall_raw
 
 
-# ----- _parse_criterion_scores tests -----
+# ----- _parse_json_criteria / _parse_json_agent_notes tests -----
 
 RUBRIC_2 = [
     {"id": "novelty", "label": "Novelty", "scale": "1-5"},
     {"id": "feasibility", "label": "Feasibility", "scale": "1-5"},
 ]
 
-WELL_FORMED_RAW = """\
-1. Novelty
-This gene has not been previously reported in this context. Multi-modal evidence strengthens the claim. The finding is genuinely surprising.
-Score: 4/5
-
-2. Feasibility
-The proposed experiment uses standard FACS protocols available in most labs. Cohort sizes are realistic given typical SLE biobank availability. Reagents are commercially available.
-Score: 3/5
+WELL_FORMED_JSON = """\
+{"criteria": [
+  {"criterion_id": "novelty", "score": "4/5", "rationale": "This gene has not been previously reported in this context. Multi-modal evidence strengthens the claim."},
+  {"criterion_id": "feasibility", "score": "3/5", "rationale": "The proposed experiment uses standard FACS protocols available in most labs."}
+]}
 """
 
 
-def test_parse_criterion_scores_basic():
-    result = _parse_criterion_scores(WELL_FORMED_RAW, RUBRIC_2)
+def test_parse_json_criteria_basic():
+    result = _parse_json_criteria(WELL_FORMED_JSON, RUBRIC_2)
     assert len(result) == 2
 
     novelty = result[0]
@@ -285,129 +398,80 @@ def test_parse_criterion_scores_basic():
     assert "FACS protocols" in feasibility.rationale
 
 
-def test_parse_criterion_scores_with_agent_note():
-    raw = """\
-1. Novelty
-Strong evidence from three independent modalities. Largely agrees with prior literature. The gene is moderately novel.
-Score: 3/5
-Agent self-assessment note: Agree with human reviewer; slight underestimation possible.
-
-2. Feasibility
-Standard protocols apply here. Cohort is accessible. Timeline is reasonable.
-Score: 4/5
-"""
-    result = _parse_criterion_scores(raw, RUBRIC_2)
+def test_parse_json_criteria_strips_markdown_code_fence():
+    raw = "```json\n" + WELL_FORMED_JSON + "\n```"
+    result = _parse_json_criteria(raw, RUBRIC_2)
     assert len(result) == 2
-    assert "Agree with human reviewer" in result[0].agent_note
-    assert result[1].agent_note == ""
+    assert result[0].score == "4/5"
 
 
-def test_parse_criterion_scores_returns_empty_on_bad_input():
-    assert _parse_criterion_scores("", RUBRIC_2) == []
-    assert _parse_criterion_scores(WELL_FORMED_RAW, []) == []
-
-
-def test_parse_preamble_before_numbered_blocks():
+def test_parse_json_criteria_skips_unknown_criterion_id():
     raw = """\
-Here is my evaluation of the two criteria below.
-
-1. Novelty
-This gene has not been previously reported. Evidence is strong.
-Score: 4/5
-
-2. Feasibility
-Standard FACS protocols apply. Reagents available.
-Score: 3/5
+{"criteria": [
+  {"criterion_id": "novelty", "score": "4/5", "rationale": "Real criterion."},
+  {"criterion_id": "hallucinated_extra_id", "score": "2/5", "rationale": "Not in rubric."}
+]}
 """
-    result = _parse_criterion_scores(raw, RUBRIC_2)
-    assert len(result) == 2
+    result = _parse_json_criteria(raw, RUBRIC_2)
+    assert len(result) == 1
     assert result[0].criterion_id == "novelty"
-    assert result[0].score == "4/5"
-    assert result[1].criterion_id == "feasibility"
-    assert result[1].score == "3/5"
 
 
-def test_parse_double_newline_fallback():
-    raw = """\
-This gene has not been previously reported. Multi-modal evidence.
-Score: 4/5
-
-Standard FACS protocols apply. Cohort sizes are realistic.
-Score: 3/5
+def test_parse_json_criteria_returns_empty_on_bad_input():
+    assert _parse_json_criteria("", RUBRIC_2) == []
+    assert _parse_json_criteria(WELL_FORMED_JSON, []) == []
+    assert _parse_json_criteria("not json at all", RUBRIC_2) == []
+    # The exact real-world failure this replaces: pass-2 restructures its entire
+    # response into an unrelated numbered critique list instead of JSON.
+    restructured_prose = """\
+1. **Source validation:** The agent does not critically evaluate this claim.
+2. **Novelty framing:** The core finding is pre-established literature.
 """
-    result = _parse_criterion_scores(raw, RUBRIC_2)
-    assert len(result) == 2
-    assert all(isinstance(cs, CriterionScore) for cs in result)
-    assert result[0].score == "4/5"
-    assert result[1].score == "3/5"
+    assert _parse_json_criteria(restructured_prose, RUBRIC_2) == []
 
 
-def test_parse_markdown_bold_score_line():
-    raw = """\
-1. Novelty
-This gene has not been previously reported. Multi-modal evidence strengthens the claim.
-**Score: 4/5**
+def test_parse_json_agent_notes_basic():
+    raw = '{"agent_notes": [{"criterion_id": "novelty", "agent_note": "Agree with human reviewer."}]}'
+    notes = _parse_json_agent_notes(raw)
+    assert notes == {"novelty": "Agree with human reviewer."}
 
-2. Feasibility
-Standard FACS protocols apply. Cohort sizes are realistic.
-**Score:** 3/5
+
+def test_parse_json_agent_notes_strips_markdown_code_fence():
+    raw = '```json\n{"agent_notes": [{"criterion_id": "novelty", "agent_note": "Agree."}]}\n```'
+    assert _parse_json_agent_notes(raw) == {"novelty": "Agree."}
+
+
+def test_parse_json_agent_notes_returns_empty_on_bad_input():
+    assert _parse_json_agent_notes("") == {}
+    assert _parse_json_agent_notes("not json") == {}
+    assert _parse_json_agent_notes('{"agent_notes": [{"agent_note": "no id given"}]}') == {}
+
+
+# ----- score_run two-pass integration tests -----
+# Regression coverage for the real failure mode this rewrite fixes: pass-2 is
+# prompted to add an agreement note without touching pass-1's scores, but the old
+# free-text design re-derived everything from pass-2's own (sometimes restructured)
+# text. Now pass-2's JSON can only ever attach agent_note to pass-1's already-parsed
+# CriterionScore objects -- it has no way to replace score or rationale at all.
+
+def test_score_run_two_pass_survives_pass2_restructuring(completed_run_with_spec_and_rationale):
+    pass2_restructured_response = """\
+1. **Source validation:** The agent does not critically evaluate this claim.
+My independent assessment differs on this point -- not valid JSON, no agent_notes key.
 """
-    result = _parse_criterion_scores(raw, RUBRIC_2)
-    assert len(result) == 2
-    assert result[0].score == "4/5"
-    assert result[1].score == "3/5"
+    mock_llm = MockLLMClient([WELL_FORMED_JSON, pass2_restructured_response, WELL_FORMED_JSON])
+    scores = score_run(completed_run_with_spec_and_rationale, client=mock_llm)
+    criteria = scores.hypothesis_scores[0].criteria
+    assert len(criteria) == 2
+    assert criteria[0].score == "4/5"  # pass-1's score survives pass-2's malformed response
+    assert criteria[0].agent_note == ""  # no valid note to attach, but nothing corrupted
 
 
-def test_parse_markdown_header_numbered_blocks():
-    raw = """\
-## 1. Novelty
-This gene has not been previously reported. Evidence is strong.
-Score: 4/5
-
-## 2. Feasibility
-Standard FACS protocols apply. Reagents available.
-Score: 3/5
-"""
-    result = _parse_criterion_scores(raw, RUBRIC_2)
-    assert len(result) == 2
-    assert result[0].criterion_id == "novelty"
-    assert result[0].score == "4/5"
-    assert "not been previously reported" in result[0].rationale
-    assert result[1].criterion_id == "feasibility"
-    assert result[1].score == "3/5"
-
-
-def test_parse_markdown_agent_note_header():
-    raw = """\
-1. Novelty
-Strong evidence from three independent modalities. Largely agrees with prior literature.
-Score: 3/5
-**Agent self-assessment note:** Agree with human reviewer; slight underestimation possible.
-
-2. Feasibility
-Standard protocols apply here. Cohort is accessible.
-Score: 4/5
-"""
-    result = _parse_criterion_scores(raw, RUBRIC_2)
-    assert len(result) == 2
-    assert result[0].score == "3/5"
-    assert "Agree with human reviewer" in result[0].agent_note
-    assert result[1].agent_note == ""
-
-
-def test_parse_missing_score_line_returns_partial():
-    raw = """\
-1. Novelty
-This gene has not been previously reported. Multi-modal evidence.
-Score: 4/5
-
-2. Feasibility
-Standard FACS protocols apply but no score provided here.
-"""
-    result = _parse_criterion_scores(raw, RUBRIC_2)
-    assert len(result) == 2
-    novelty = next(cs for cs in result if cs.criterion_id == "novelty")
-    feasibility = next(cs for cs in result if cs.criterion_id == "feasibility")
+def test_score_run_two_pass_attaches_agent_note_on_success(completed_run_with_spec_and_rationale):
+    pass2_notes = '{"agent_notes": [{"criterion_id": "novelty", "agent_note": "Agrees with agent."}]}'
+    mock_llm = MockLLMClient([WELL_FORMED_JSON, pass2_notes, WELL_FORMED_JSON])
+    scores = score_run(completed_run_with_spec_and_rationale, client=mock_llm)
+    criteria = scores.hypothesis_scores[0].criteria
+    novelty = next(c for c in criteria if c.criterion_id == "novelty")
     assert novelty.score == "4/5"
-    assert feasibility.score == ""
-    assert feasibility.rationale != ""
+    assert novelty.agent_note == "Agrees with agent."

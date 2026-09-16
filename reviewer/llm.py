@@ -113,17 +113,22 @@ class LLMClient:
 
 
 class MockLLMClient:
-    """Deterministic stub for tests. Returns a fixed response string."""
+    """Deterministic stub for tests. Returns a fixed response string, or successive
+    responses from a list (one per call, repeating the last one once exhausted) --
+    useful for testing multi-call flows like two-pass scoring where each call needs
+    a different canned response.
+    """
 
-    def __init__(self, response: str = ""):
-        self._response = response
+    def __init__(self, response: str | list[str] = ""):
+        self._responses = [response] if isinstance(response, str) else list(response)
         self.call_count = 0
         self.calls: list[list[dict]] = []
 
     def chat(self, messages: list[dict], schema: dict | None = None) -> str:
-        self.call_count += 1
         self.calls.append(messages)
-        return self._response
+        idx = min(self.call_count, len(self._responses) - 1)
+        self.call_count += 1
+        return self._responses[idx] if self._responses else ""
 
 
 def get_llm_client() -> LLMClient:

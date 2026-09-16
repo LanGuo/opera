@@ -13,7 +13,7 @@ class CriterionScore:
     criterion_id: str   # matches rubric item id (e.g. "novelty")
     rationale: str      # 2-3 sentence evidence-grounded justification
     score: str          # "4/5", "yes", "partial", etc — matches rubric scale
-    agent_note: str     # pass-2 agreement/divergence note; empty string if no pass 2
+    agent_note: str = ""  # pass-2 agreement/divergence note; empty string if no pass 2
 
 
 @dataclass
@@ -75,6 +75,33 @@ _BIAS_PREAMBLE = (
     "or presentation style — only scientific content and rigor."
 )
 
+# Shared JSON-output contract for both pass-1 scoring calls (per-hypothesis and overall).
+# Free-text output ("Score: X/5" lines) proved unreliable to parse back out: judge models
+# inconsistently wrapped it in markdown, restructured pass-2 responses entirely, or used
+# numbered sub-lists inside a criterion's own rationale that collided with the block
+# splitter. JSON has no such ambiguity — the model's prose lives inside string values,
+# never in a position that could be mistaken for a structural boundary.
+_JSON_PASS1_INSTRUCTION = (
+    '\nReturn ONLY a JSON object with no markdown code fence, matching this shape:\n'
+    '{{"criteria": [{{"criterion_id": <str>, "score": <str, e.g. "4/5" or "yes/no/partial">, '
+    '"rationale": <str, 2-3 sentences>}}, ...]}}\n'
+    'Include exactly one entry per criterion below, using the exact criterion_id given for each.\n'
+)
+
+_JSON_PASS2_INSTRUCTION = (
+    '\nReturn ONLY a JSON object with no markdown code fence, matching this shape:\n'
+    '{"agent_notes": [{"criterion_id": <str>, "agent_note": <str, 1-2 sentences>}, ...]}\n'
+    "Include one entry per criterion_id listed above — do not restate scores or rationale."
+)
+
+
+def _evidence_text(item, default_type: str = "unknown") -> tuple[str, str]:
+    """Return (type, description) for an evidence item that may be a plain string
+    (Gemini's format) or a dict (Claude's format)."""
+    if isinstance(item, str):
+        return default_type, item
+    return item.get("type", default_type), item.get("description", "")
+
 
 def _format_evidence_trail(update_history: list) -> str:
     """Render update_history as an evidence timeline, excluding confidence numbers and rationale."""
@@ -86,8 +113,7 @@ def _format_evidence_trail(update_history: list) -> str:
         old_evidence = update.get("changes", {}).get("from", {}).get("evidence", [])
         added = [e for e in new_evidence if e not in old_evidence]
         for ev in added:
-            ev_type = ev.get("type", "unknown")
-            description = ev.get("description", "")
+            ev_type, description = _evidence_text(ev)
             lines.append(f"  Step {i} — {ev_type}: {description}")
     return "\n".join(lines)
 
@@ -108,21 +134,27 @@ def _format_refuted_hypotheses(all_hypotheses: dict) -> str:
         gene = h.get("candidate_gene", "unknown")
         cell_type = h.get("cell_type", "unknown")
         evidence = h.get("evidence", [])
-        ev_summary = "; ".join(
-            e.get("description", "")[:120] for e in evidence if e.get("description")
-        )
+        descriptions = [_evidence_text(e)[1] for e in evidence]
+        ev_summary = "; ".join(d[:120] for d in descriptions if d)
         lines.append(f"  - {cell_type}/{gene}: evidence found — {ev_summary or 'none'}")
     return "\n".join(lines)
+
+
+def _format_criteria_listing(items: list) -> str:
+    """Render rubric items with explicit criterion_id, so the model echoes back an id
+    we can match on rather than relying on positional/count alignment."""
+    return "\n\n".join(
+        f"- criterion_id: {item.get('id', f'criterion_{i}')}\n"
+        f"  label: {item.get('label', item.get('id', 'unknown'))}\n"
+        f"  guidance: {item.get('guidance', '')}"
+        for i, item in enumerate(items)
+    )
 
 
 def _build_per_hypothesis_prompt_pass1(
     goal: str, per_items: list, hypothesis_str: str, evidence_str: str,
     validation: str, evidence_trail: str, open_questions_str: str,
 ) -> str:
-    criteria = "\n\n".join(
-        f"{i + 1}. {item.get('label', item.get('id', 'unknown'))}\n   {item.get('guidance', '')}"
-        for i, item in enumerate(per_items)
-    )
     parts = [
         f"Task goal: {goal}\n",
         f"You are scoring a completed AI agent evaluation run. {_BIAS_PREAMBLE}\n",
@@ -135,34 +167,28 @@ def _build_per_hypothesis_prompt_pass1(
         parts.append(open_questions_str)
     if validation:
         parts.append(f"Proposed validation: {validation}")
-    parts.append(
-        '\nFor each criterion below write 2–3 sentences then end with '
-        '"Score: X/5" or "Score: yes/no/partial".\n'
-    )
-    parts.append(criteria)
+    parts.append(_JSON_PASS1_INSTRUCTION)
+    parts.append(_format_criteria_listing(per_items))
     return "\n\n".join(parts)
 
 
 def _build_per_hypothesis_prompt_pass2(
-    pass1_response: str, agent_rationale: str,
+    criteria: list["CriterionScore"], agent_rationale: str,
 ) -> str:
+    scores_summary = "\n".join(f"- {c.criterion_id}: {c.score} — {c.rationale}" for c in criteria)
     return (
-        "You just scored this hypothesis based on observed evidence. "
+        "You just scored this hypothesis based on observed evidence:\n"
+        f"{scores_summary}\n\n"
         "Now review the agent's own rationale for the same hypothesis and note where your "
-        "independent assessment agrees or diverges. Keep your scores — only add a brief "
-        '"Agent self-assessment note:" paragraph at the end.\n\n'
-        f"Your prior scoring:\n{pass1_response}\n\n"
+        "independent assessment agrees or diverges, for each criterion above.\n\n"
         f"Agent's rationale for the final belief update:\n{agent_rationale}"
+        f"{_JSON_PASS2_INSTRUCTION}"
     )
 
 
 def _build_overall_prompt_pass1(
     goal: str, overall_items: list, metrics: dict, refuted_str: str,
 ) -> str:
-    criteria = "\n\n".join(
-        f"{i + 1}. {item.get('label', item.get('id', 'unknown'))}\n   {item.get('guidance', '')}"
-        for i, item in enumerate(overall_items)
-    )
     parts = [
         f"Task goal: {goal}\n",
         f"You are scoring a completed AI agent evaluation run. {_BIAS_PREAMBLE}\n",
@@ -173,110 +199,101 @@ def _build_overall_prompt_pass1(
     ]
     if refuted_str:
         parts.append(f"\n{refuted_str}")
-    parts.append(
-        '\nFor each criterion below write 2–3 sentences then end with '
-        '"Score: X/5" or "Score: yes/no/partial".\n'
-    )
-    parts.append(criteria)
+    parts.append(_JSON_PASS1_INSTRUCTION)
+    parts.append(_format_criteria_listing(overall_items))
     return "\n\n".join(parts)
 
 
 def _build_overall_prompt_pass2(
-    pass1_response: str, termination_rationale: str, confidence_summary: str,
+    criteria: list["CriterionScore"], termination_rationale: str, confidence_summary: str,
 ) -> str:
+    scores_summary = "\n".join(f"- {c.criterion_id}: {c.score} — {c.rationale}" for c in criteria)
     return (
-        "You just scored the overall run quality based on observed metrics. "
+        "You just scored the overall run quality based on observed metrics:\n"
+        f"{scores_summary}\n\n"
         "Now review the agent's own termination rationale and confidence summary, and note "
-        "where your independent assessment agrees or diverges. Keep your scores — only add a brief "
-        '"Agent self-assessment note:" paragraph at the end.\n\n'
-        f"Your prior scoring:\n{pass1_response}\n\n"
+        "where your independent assessment agrees or diverges, for each criterion above.\n\n"
         f"Agent's termination rationale:\n{termination_rationale}\n\n"
         f"Agent's confidence summary:\n{confidence_summary}"
+        f"{_JSON_PASS2_INSTRUCTION}"
     )
 
 
-def _parse_criterion_scores(raw: str, rubric_items: list) -> list[CriterionScore]:
-    """Parse per-criterion scores from LLM free-text output.
+def _strip_json_fence(raw: str) -> str:
+    return re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
 
-    Splits raw text on double-newlines or numbered headings to find per-criterion
-    blocks, then extracts Score lines and agent notes. Returns empty list only if
-    raw is empty or no blocks were found at all; partial results use score="".
+
+def _parse_json_criteria(raw: str, rubric_items: list) -> list[CriterionScore]:
+    """Parse pass-1's JSON criteria response, keeping only entries whose criterion_id
+    matches a real rubric item (guards against a hallucinated or malformed id rather
+    than silently accepting it). Returns [] on any parse failure.
     """
     if not raw or not rubric_items:
         return []
-
-    # Markdown formatting the model may wrap around structural markers (bold, headers).
-    # Tolerated on both sides of "Score:" / "Agent self-assessment note:" / numbered
-    # headings, since judge models inconsistently emit "**Score: 4/5**", "## 1. Novelty",
-    # "**Score:** 4/5", etc. instead of the plain text the prompt asked for.
-    # Deliberately excludes \n -- matching across newlines here would bridge the blank
-    # line between blocks and corrupt the block-split boundaries.
-    _MD = r'[#*]{0,4}[ \t]{0,3}'
-
+    valid_ids = {item.get("id", f"criterion_{i}") for i, item in enumerate(rubric_items)}
     try:
-        # Split on numbered headings (e.g. "1. " or "2. ", optionally markdown-wrapped)
-        # or double newlines. Try numbered heading split first.
-        blocks = re.split(r'\n(?=' + _MD + r'\d+\.\s)', raw.strip())
-        if len(blocks) < 2:
-            # Fall back to double-newline split
-            blocks = [b.strip() for b in re.split(r'\n\n+', raw.strip()) if b.strip()]
-        else:
-            # Fix 1: drop preamble block if block 0 doesn't look like a criterion block
-            # (i.e. doesn't start with a digit and has no Score: line)
-            if blocks and not re.match(r'^' + _MD + r'\d+\.', blocks[0].strip()) and not re.search(
-                r'(?:^|\n)' + _MD + r'Score:', blocks[0], re.IGNORECASE | re.MULTILINE
-            ):
-                blocks = blocks[1:]
-
-        if not blocks:
-            return []
-
-        # Match blocks to rubric items by position
+        parsed = json.loads(_strip_json_fence(raw))
         result = []
-        for i, item in enumerate(rubric_items):
-            if i >= len(blocks):
-                break
-            block = blocks[i].strip()
-
-            # Extract agent note if present
-            agent_note = ""
-            note_match = re.search(
-                _MD + r'Agent self-assessment note:' + _MD + r'(.+?)(?:\n|$)',
-                block, re.IGNORECASE | re.DOTALL,
-            )
-            if note_match:
-                agent_note = note_match.group(1).strip(' *#')
-                block = block[:note_match.start()].strip()
-
-            # Fix 3: anchor Score regex to line start to avoid matching "Novelty Score:" mid-rationale
-            score_match = re.search(
-                r'(?:^|\n)' + _MD + r'Score:' + _MD + r'([^\n]+)', block, re.IGNORECASE | re.MULTILINE
-            )
-            # Fix 2: emit partial result instead of returning [] on missing Score line
-            if not score_match:
-                result.append(CriterionScore(
-                    criterion_id=item.get("id", f"criterion_{i}"),
-                    rationale=block.strip(),
-                    score="",
-                    agent_note=agent_note,
-                ))
+        for c in parsed.get("criteria", []):
+            cid = c.get("criterion_id", "")
+            if cid not in valid_ids:
                 continue
-
-            score_val = score_match.group(1).strip().strip(' *#')
-            rationale = block[:score_match.start()].strip()
-            # Remove leading numbered heading (optionally markdown-wrapped) from rationale
-            rationale = re.sub(r'^' + _MD + r'\d+\.\s+[^\n]*\n', '', rationale).strip()
-
             result.append(CriterionScore(
-                criterion_id=item.get("id", f"criterion_{i}"),
-                rationale=rationale,
-                score=score_val,
-                agent_note=agent_note,
+                criterion_id=cid,
+                rationale=str(c.get("rationale", "")).strip(),
+                score=str(c.get("score", "")).strip(),
             ))
-
         return result
-    except Exception:
+    except (json.JSONDecodeError, ValueError, AttributeError, TypeError):
         return []
+
+
+def _parse_json_agent_notes(raw: str) -> dict[str, str]:
+    """Parse pass-2's JSON agent-notes response into {criterion_id: note}. Returns {}
+    on any parse failure — pass-1's scores/rationale are never affected by this,
+    since agent_note is applied as an annotation on top of pass-1's own CriterionScore
+    objects rather than by re-deriving anything from pass-2's text.
+    """
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(_strip_json_fence(raw))
+        return {
+            n["criterion_id"]: str(n.get("agent_note", "")).strip()
+            for n in parsed.get("agent_notes", [])
+            if n.get("criterion_id")
+        }
+    except (json.JSONDecodeError, ValueError, AttributeError, TypeError, KeyError):
+        return {}
+
+
+def _score_criteria_two_pass(
+    client: LLMClient, prompt1: str, rubric_items: list,
+    build_prompt2: "callable | None", raw_label: str,
+) -> tuple[str, list[CriterionScore]]:
+    """Run pass-1 scoring, then optionally pass-2 (agent-note-only) annotation.
+
+    build_prompt2, if given, is a zero-arg callable returning the pass-2 prompt string
+    (built from the already-parsed pass-1 criteria) — deferred so pass-2 is skipped
+    entirely when pass-1 yields nothing to annotate.
+    Returns (raw_text_for_display, criteria). Pass-2 can only ADD agent_note to
+    criteria pass-1 already produced; it can never replace score or rationale.
+    """
+    pass1 = client.chat([{"role": "user", "content": prompt1}])
+    criteria = _parse_json_criteria(pass1, rubric_items)
+    raw_display = pass1
+
+    if build_prompt2 is not None and criteria:
+        prompt2 = build_prompt2(criteria)
+        pass2 = client.chat([{"role": "user", "content": prompt2}])
+        notes = _parse_json_agent_notes(pass2)
+        if notes:
+            for c in criteria:
+                if c.criterion_id in notes:
+                    c.agent_note = notes[c.criterion_id]
+        raw_display = f"{pass1}\n\n--- {raw_label} agreement notes ---\n\n{pass2}"
+
+    return raw_display, criteria
 
 
 def score_run(run_dir: str, client: LLMClient | None = None) -> RunScores:
@@ -329,24 +346,19 @@ def score_run(run_dir: str, client: LLMClient | None = None) -> RunScores:
                 agent_rationale = update_history[-1].get("rationale", "")
 
             per_hyp_raw = ""
+            criteria: list[CriterionScore] = []
             if per_items:
                 prompt1 = _build_per_hypothesis_prompt_pass1(
                     goal, per_items, hypothesis_str, evidence_str,
                     validation, evidence_trail, open_questions_str,
                 )
-                pass1 = client.chat([{"role": "user", "content": prompt1}])
-
-                if agent_rationale:
-                    prompt2 = _build_per_hypothesis_prompt_pass2(pass1, agent_rationale)
-                    per_hyp_raw = client.chat([
-                        {"role": "user", "content": prompt1},
-                        {"role": "assistant", "content": pass1},
-                        {"role": "user", "content": prompt2},
-                    ])
-                else:
-                    per_hyp_raw = pass1
-
-            criteria = _parse_criterion_scores(per_hyp_raw, per_items)
+                build_prompt2 = (
+                    (lambda crit: _build_per_hypothesis_prompt_pass2(crit, agent_rationale))
+                    if agent_rationale else None
+                )
+                per_hyp_raw, criteria = _score_criteria_two_pass(
+                    client, prompt1, per_items, build_prompt2, "per-hypothesis",
+                )
             scores.append(HypothesisScores(
                 hypothesis_id=h.get("hypothesis_id", "unknown"),
                 candidate_gene=gene,
@@ -368,18 +380,13 @@ def score_run(run_dir: str, client: LLMClient | None = None) -> RunScores:
                 ) / max(n_hyps, 1),
             }
             prompt1 = _build_overall_prompt_pass1(goal, overall_items, metrics_summary, refuted_str)
-            pass1 = client.chat([{"role": "user", "content": prompt1}])
-
-            if termination_rationale or confidence_summary:
-                prompt2 = _build_overall_prompt_pass2(pass1, termination_rationale, confidence_summary)
-                overall_raw = client.chat([
-                    {"role": "user", "content": prompt1},
-                    {"role": "assistant", "content": pass1},
-                    {"role": "user", "content": prompt2},
-                ])
-            else:
-                overall_raw = pass1
-            overall_criteria = _parse_criterion_scores(overall_raw, overall_items)
+            build_prompt2 = (
+                (lambda crit: _build_overall_prompt_pass2(crit, termination_rationale, confidence_summary))
+                if (termination_rationale or confidence_summary) else None
+            )
+            overall_raw, overall_criteria = _score_criteria_two_pass(
+                client, prompt1, overall_items, build_prompt2, "overall",
+            )
 
     else:
         # Fallback: no task_spec.yaml in run dir — use hardcoded SLE prompts
@@ -426,22 +433,34 @@ def score_run_all_backends(run_dir: str) -> dict[str, RunScores]:
     """
     backends: list[tuple[str, LLMClient]] = []
 
+    # JSON output (criterion_id/score/rationale repeated per entry, quoted and
+    # escaped) runs noticeably longer than the old free-text format did for the
+    # same content -- bump past the client's 4096 default so a detailed multi-
+    # criterion response doesn't get truncated mid-JSON.
+    JUDGE_MAX_TOKENS = 8192
+
     if os.environ.get("ANTHROPIC_API_KEY"):
         try:
-            backends.append(("anthropic", LLMClient(backend="anthropic", model="claude-haiku-4-5")))
+            backends.append(("anthropic", LLMClient(
+                backend="anthropic", model="claude-haiku-4-5", max_tokens=JUDGE_MAX_TOKENS,
+            )))
         except Exception as exc:
             print(f"[score] skipping anthropic backend: {exc}", file=sys.stderr)
 
     if os.environ.get("GOOGLE_API_KEY"):
         try:
-            backends.append(("google", LLMClient(backend="google", model="gemini-2.5-flash")))
+            backends.append(("google", LLMClient(
+                backend="google", model="gemini-2.5-flash", max_tokens=JUDGE_MAX_TOKENS,
+            )))
         except Exception as exc:
             print(f"[score] skipping google backend: {exc}", file=sys.stderr)
 
     ollama_model = os.environ.get("OLLAMA_MODEL")
     if ollama_model:
         try:
-            backends.append((f"ollama:{ollama_model}", LLMClient(backend="ollama", model=ollama_model)))
+            backends.append((f"ollama:{ollama_model}", LLMClient(
+                backend="ollama", model=ollama_model, max_tokens=JUDGE_MAX_TOKENS,
+            )))
         except Exception as exc:
             print(f"[score] skipping ollama backend: {exc}", file=sys.stderr)
 
