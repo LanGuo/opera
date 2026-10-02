@@ -197,6 +197,144 @@ def test_assess_terminal_hypotheses_includes_active_with_evidence(tmp_path):
     assert "E0" not in assessed_ids  # no evidence excluded
 
 
+# --- aggregation self-consistency check (LLM's own e-values vs. its own confidence) ---
+# Distinct from the AGREEING/DIVERGING fixtures above, which compare observer_confidence
+# against an *independently, regex-derived* e-value read of the raw text. These fixtures
+# instead ask a narrower, purely arithmetic question: given the e-values the model itself
+# assigned in evidence_assessments, does E=prod(e_i), C=E/(1+E) match the confidence it
+# itself reported?
+
+MOCK_OBSERVER_RESPONSE_SELF_CONSISTENT = json.dumps({
+    # own e-values multiply to E=10 -> C=10/11=0.909; self-reported confidence matches
+    "observer_confidence": 0.91,
+    "evidence_assessments": [
+        {"source": "DEG", "e_value": 5.0, "reasoning": "adj.p < 0.01 supports"},
+        {"source": "GWAS", "e_value": 2.0, "reasoning": "moderate association"},
+    ],
+    "falsification_criteria": [],
+})
+
+MOCK_OBSERVER_RESPONSE_SELF_INCONSISTENT = json.dumps({
+    # same own e-values (E=10 -> C=0.909), but self-reported confidence is disconnected
+    # from them entirely -- the model's final number doesn't follow from its own math
+    "observer_confidence": 0.30,
+    "evidence_assessments": [
+        {"source": "DEG", "e_value": 5.0, "reasoning": "adj.p < 0.01 supports"},
+        {"source": "GWAS", "e_value": 2.0, "reasoning": "moderate association"},
+    ],
+    "falsification_criteria": [],
+})
+
+MOCK_OBSERVER_RESPONSE_NO_ASSESSMENTS = json.dumps({
+    "observer_confidence": 0.95,
+    "evidence_assessments": [],
+    "falsification_criteria": [],
+})
+
+
+def test_assess_hypothesis_llm_e_value_product_from_own_assessments():
+    result = assess_hypothesis(MOCK_HYPOTHESIS, MockLLMClient(MOCK_OBSERVER_RESPONSE_SELF_CONSISTENT))
+    assert result.llm_e_value_product == pytest.approx(10.0)
+    assert result.llm_recomputed_confidence == pytest.approx(10 / 11, abs=0.01)
+
+
+def test_assess_hypothesis_not_flagged_when_self_consistent():
+    result = assess_hypothesis(MOCK_HYPOTHESIS, MockLLMClient(MOCK_OBSERVER_RESPONSE_SELF_CONSISTENT))
+    assert result.aggregation_inconsistent is False
+    assert abs(result.aggregation_delta) < 0.05
+
+
+def test_assess_hypothesis_flagged_when_self_inconsistent():
+    result = assess_hypothesis(MOCK_HYPOTHESIS, MockLLMClient(MOCK_OBSERVER_RESPONSE_SELF_INCONSISTENT))
+    assert result.aggregation_inconsistent is True
+    # 0.30 reported vs 0.909 implied by its own e-values
+    assert result.aggregation_delta == pytest.approx(0.30 - 10 / 11, abs=0.01)
+
+
+def test_assess_hypothesis_self_inconsistent_prints_warning(capsys):
+    assess_hypothesis(MOCK_HYPOTHESIS, MockLLMClient(MOCK_OBSERVER_RESPONSE_SELF_INCONSISTENT))
+    captured = capsys.readouterr()
+    assert "arithmetically inconsistent" in captured.err
+
+
+def test_assess_hypothesis_no_assessments_not_flagged():
+    """Missing per-item breakdown is a data gap, not an arithmetic inconsistency."""
+    result = assess_hypothesis(MOCK_HYPOTHESIS, MockLLMClient(MOCK_OBSERVER_RESPONSE_NO_ASSESSMENTS))
+    assert result.aggregation_inconsistent is False
+
+
+# --- broadened deterministic e-value extraction (percentages, effect sizes, caveats) ---
+
+def test_extract_e_values_sensitivity_specificity_percentage():
+    evidence = [{"description": "Sensitivity 98.7%, specificity 82.1% for diagnosis", "source": "clinical"}]
+    E = _extract_e_values_from_text(evidence)
+    assert E == pytest.approx(3.0)  # both >=90... actually first match (sensitivity 98.7) wins
+
+
+def test_extract_e_values_moderate_percentage():
+    evidence = [{"description": "accuracy 75% in validation cohort", "source": "clinical"}]
+    E = _extract_e_values_from_text(evidence)
+    assert E == pytest.approx(2.0)
+
+
+def test_extract_e_values_interaction_score():
+    evidence = [{"description": "STRING combined score 0.83, strong interaction", "source": "STRING"}]
+    E = _extract_e_values_from_text(evidence)
+    assert E == pytest.approx(1.5)
+
+
+def test_extract_e_values_effect_size_without_pvalue():
+    evidence = [{"description": "odds ratio 2.4 for disease association", "source": "GWAS"}]
+    E = _extract_e_values_from_text(evidence)
+    assert E == pytest.approx(2.0)
+
+
+def test_extract_e_values_caution_caveat_not_caught_by_old_keywords():
+    """Explicit caveats phrased as caution/non-specificity, not the original narrow wording."""
+    evidence = [{"description": "CAUTION: marker is not SLE-specific, also elevated in COVID-19", "source": "lit"}]
+    E = _extract_e_values_from_text(evidence)
+    assert E == pytest.approx(0.5)
+
+
+def test_extract_e_values_orphan_druggability_caveat():
+    evidence = [{"description": "orphan protein with no known natural substrate", "source": "GeneCards"}]
+    E = _extract_e_values_from_text(evidence)
+    assert E == pytest.approx(0.5)
+
+
+# --- negation-prefix substring bug: "insignificant" must not match "significant" ---
+
+def test_extract_e_values_insignificant_not_treated_as_supporting():
+    evidence = [{"description": "effect was insignificant across all cohorts", "source": "lit"}]
+    E = _extract_e_values_from_text(evidence)
+    assert E == pytest.approx(0.5)  # correctly contradicting, not 1.5
+
+
+def test_extract_e_values_unsupported_not_treated_as_supporting():
+    evidence = [{"description": "the association was unsupported by replication", "source": "lit"}]
+    E = _extract_e_values_from_text(evidence)
+    assert E == pytest.approx(0.5)
+
+
+def test_extract_e_values_invalidated_not_treated_as_supporting():
+    evidence = [{"description": "the prior finding was invalidated by a larger cohort", "source": "lit"}]
+    E = _extract_e_values_from_text(evidence)
+    assert E == pytest.approx(0.5)
+
+
+def test_extract_e_values_unconfirmed_not_treated_as_supporting():
+    evidence = [{"description": "the interaction remains unconfirmed in vivo", "source": "lit"}]
+    E = _extract_e_values_from_text(evidence)
+    assert E == pytest.approx(0.5)
+
+
+def test_extract_e_values_suffix_still_matches_root_keyword():
+    """The fix must not break legitimate suffix matches like support -> supports/supported."""
+    evidence = [{"description": "this result strongly supports the hypothesis", "source": "lit"}]
+    E = _extract_e_values_from_text(evidence)
+    assert E == pytest.approx(1.5)
+
+
 def test_assess_terminal_hypotheses_raises_without_backend(tmp_path, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)

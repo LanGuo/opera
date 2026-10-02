@@ -1,4 +1,6 @@
+import json
 import os
+import re
 import time
 
 import anthropic as _anthropic_sdk
@@ -12,6 +14,33 @@ try:
     from google import genai as _genai
 except ImportError:
     _genai = None  # type: ignore[assignment]
+
+
+_LEADING_FENCE = re.compile(r"^```(?:json)?\s*")
+
+
+def extract_json_object(raw: str) -> dict:
+    """Parse the first complete top-level JSON object in `raw`, ignoring anything
+    that follows it.
+
+    Models are routinely instructed to "return ONLY a JSON object," but often
+    append prose after a valid, complete JSON block anyway (a restated summary,
+    caveats, etc.) despite the instruction. A naive `json.loads` on the whole
+    string then fails with "Extra data" even though the JSON itself was fine.
+    Stripping a trailing fence with a string match doesn't fix this either,
+    since the trailing content is rarely a bare ``` at the very end — there's
+    usually more text after it. Using json.JSONDecoder().raw_decode from the
+    first `{` sidesteps the problem entirely: it parses exactly one JSON value
+    and stops, regardless of what comes after.
+
+    Raises json.JSONDecodeError if no JSON object can be found/parsed.
+    """
+    text = _LEADING_FENCE.sub("", raw.strip())
+    start = text.find("{")
+    if start == -1:
+        raise json.JSONDecodeError("No JSON object found in response", text, 0)
+    obj, _end_index = json.JSONDecoder().raw_decode(text, start)
+    return obj
 
 
 class LLMClient:

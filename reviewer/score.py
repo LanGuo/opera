@@ -5,7 +5,7 @@ import sys
 from dataclasses import dataclass, field
 
 from hypothesis_ledger.workspace import Workspace
-from reviewer.llm import LLMClient, get_llm_client
+from reviewer.llm import LLMClient, extract_json_object, get_llm_client
 
 
 @dataclass
@@ -142,10 +142,18 @@ def _format_refuted_hypotheses(all_hypotheses: dict) -> str:
 
 def _format_criteria_listing(items: list) -> str:
     """Render rubric items with explicit criterion_id, so the model echoes back an id
-    we can match on rather than relying on positional/count alignment."""
+    we can match on rather than relying on positional/count alignment.
+
+    Includes each item's own `scale` explicitly (e.g. "1-5" vs. "yes/no/partial").
+    Without this, the model has to infer the right format per criterion from the
+    pass-1 instruction's generic example alone, which shows both formats without
+    tying either to a specific criterion — observed in practice to produce a
+    "partial" answer for a 1-5-scale criterion.
+    """
     return "\n\n".join(
         f"- criterion_id: {item.get('id', f'criterion_{i}')}\n"
         f"  label: {item.get('label', item.get('id', 'unknown'))}\n"
+        f"  scale: {item.get('scale', '1-5')}\n"
         f"  guidance: {item.get('guidance', '')}"
         for i, item in enumerate(items)
     )
@@ -219,10 +227,6 @@ def _build_overall_prompt_pass2(
     )
 
 
-def _strip_json_fence(raw: str) -> str:
-    return re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
-
-
 def _parse_json_criteria(raw: str, rubric_items: list) -> list[CriterionScore]:
     """Parse pass-1's JSON criteria response, keeping only entries whose criterion_id
     matches a real rubric item (guards against a hallucinated or malformed id rather
@@ -232,7 +236,7 @@ def _parse_json_criteria(raw: str, rubric_items: list) -> list[CriterionScore]:
         return []
     valid_ids = {item.get("id", f"criterion_{i}") for i, item in enumerate(rubric_items)}
     try:
-        parsed = json.loads(_strip_json_fence(raw))
+        parsed = extract_json_object(raw)
         result = []
         for c in parsed.get("criteria", []):
             cid = c.get("criterion_id", "")
@@ -257,7 +261,7 @@ def _parse_json_agent_notes(raw: str) -> dict[str, str]:
     if not raw:
         return {}
     try:
-        parsed = json.loads(_strip_json_fence(raw))
+        parsed = extract_json_object(raw)
         return {
             n["criterion_id"]: str(n.get("agent_note", "")).strip()
             for n in parsed.get("agent_notes", [])

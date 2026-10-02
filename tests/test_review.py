@@ -474,7 +474,7 @@ def test_main_missing_arg_exits(monkeypatch):
 # Falsification section tests
 from unittest.mock import patch
 from reviewer.falsification import FalsificationResult, EvidenceAssessment
-from reviewer.review import _render_falsification_section
+from reviewer.review import _render_falsification_criteria, _render_falsification_scores
 
 MOCK_FALSIFICATION_RESULTS = [
     FalsificationResult(
@@ -492,22 +492,80 @@ MOCK_FALSIFICATION_RESULTS = [
     )
 ]
 
-def test_render_falsification_section_returns_html():
-    html = _render_falsification_section(MOCK_FALSIFICATION_RESULTS)
-    assert "<table" in html or "<div" in html
+# --- _render_falsification_criteria (unblurred, shown before human scores) ---
 
-def test_render_falsification_section_contains_hypothesis_id():
-    html = _render_falsification_section(MOCK_FALSIFICATION_RESULTS)
+def test_render_falsification_criteria_returns_html():
+    html = _render_falsification_criteria(MOCK_FALSIFICATION_RESULTS)
+    assert "<table" in html
+
+def test_render_falsification_criteria_contains_hypothesis_id():
+    html = _render_falsification_criteria(MOCK_FALSIFICATION_RESULTS)
     assert "ABCD12" in html
 
-def test_render_falsification_section_shows_confidence_values():
-    html = _render_falsification_section(MOCK_FALSIFICATION_RESULTS)
+def test_render_falsification_criteria_contains_criteria_text():
+    html = _render_falsification_criteria(MOCK_FALSIFICATION_RESULTS)
+    assert "Would effect disappear in controls?" in html
+
+def test_render_falsification_criteria_excludes_observer_confidence():
+    """The whole point of the split: no score-like number here, only the criteria text."""
+    html = _render_falsification_criteria(MOCK_FALSIFICATION_RESULTS)
+    assert "0.62" not in html
+    assert "-0.23" not in html
+
+def test_render_falsification_criteria_empty_results():
+    assert _render_falsification_criteria([]) == ""
+
+
+# --- _render_falsification_scores (locked/blurred, same as LLM judge scores) ---
+
+def test_render_falsification_scores_returns_html():
+    html = _render_falsification_scores(MOCK_FALSIFICATION_RESULTS)
+    assert "<table" in html
+
+def test_render_falsification_scores_contains_hypothesis_id():
+    html = _render_falsification_scores(MOCK_FALSIFICATION_RESULTS)
+    assert "ABCD12" in html
+
+def test_render_falsification_scores_shows_confidence_values():
+    html = _render_falsification_scores(MOCK_FALSIFICATION_RESULTS)
     assert "0.85" in html  # agent
     assert "0.62" in html  # observer
 
-def test_render_falsification_section_shows_delta():
-    html = _render_falsification_section(MOCK_FALSIFICATION_RESULTS)
+def test_render_falsification_scores_shows_delta():
+    html = _render_falsification_scores(MOCK_FALSIFICATION_RESULTS)
     assert "-0.23" in html
+
+def test_render_falsification_scores_none_agent_confidence():
+    result_no_conf = FalsificationResult(
+        hypothesis_id="XY99",
+        agent_confidence=None,
+        observer_confidence=0.55,
+        e_value_product=2.0,
+        e_value_confidence=0.67,
+        confidence_delta=0.05,
+        falsification_criteria=[],
+        evidence_assessments=[],
+    )
+    html = _render_falsification_scores([result_no_conf])
+    assert "N/A" in html
+
+
+def test_falsification_criteria_appears_before_locked_section_scores_do_not(minimal_data):
+    """Regression test for the anchoring-risk fix: the criteria must render before
+    the human-facing scoring form (unblurred), while the observer's numeric score
+    must only appear inside the locked section (blurred until after submission)."""
+    from reviewer.review import render_html
+    html = render_html(
+        minimal_data,
+        falsification_criteria_html=_render_falsification_criteria(MOCK_FALSIFICATION_RESULTS),
+        falsification_scores_html=_render_falsification_scores(MOCK_FALSIFICATION_RESULTS),
+    )
+    criteria_idx = html.find("Would effect disappear in controls?")
+    locked_idx = html.find('id="locked-section"')
+    observer_score_idx = html.find("0.62")
+    assert criteria_idx != -1 and locked_idx != -1 and observer_score_idx != -1
+    assert criteria_idx < locked_idx < observer_score_idx
+
 
 def test_generate_review_html_includes_falsification_when_results_provided():
     from reviewer.review import generate_review_html
@@ -598,18 +656,3 @@ def test_contested_score_flagged(minimal_data):
     }]
     html = render_html(minimal_data)
     assert "score-contested" in html
-
-
-def test_render_falsification_section_none_agent_confidence():
-    result_no_conf = FalsificationResult(
-        hypothesis_id="XY99",
-        agent_confidence=None,
-        observer_confidence=0.55,
-        e_value_product=2.0,
-        e_value_confidence=0.67,
-        confidence_delta=0.05,
-        falsification_criteria=[],
-        evidence_assessments=[],
-    )
-    html = _render_falsification_section([result_no_conf])
-    assert "N/A" in html

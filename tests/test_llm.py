@@ -1,6 +1,56 @@
+import json
 import pytest
 from unittest.mock import MagicMock, patch
-from reviewer.llm import LLMClient, MockLLMClient, get_llm_client
+from reviewer.llm import LLMClient, MockLLMClient, extract_json_object, get_llm_client
+
+
+# --- extract_json_object ---
+
+def test_extract_json_object_plain():
+    obj = extract_json_object('{"a": 1}')
+    assert obj == {"a": 1}
+
+
+def test_extract_json_object_strips_leading_fence():
+    obj = extract_json_object('```json\n{"a": 1}\n```')
+    assert obj == {"a": 1}
+
+
+def test_extract_json_object_ignores_trailing_prose():
+    """The bug this guards: models sometimes emit a complete, valid JSON block
+    inside a fence and then keep writing prose afterward despite being told to
+    return only JSON. A trailing fence isn't at the end of the string in that
+    case, so naive fence-stripping + json.loads fails with 'Extra data'."""
+    raw = (
+        '```json\n{"observer_confidence": 0.72, "evidence_assessments": []}\n```\n\n'
+        "**Summary Assessment:**\n\nThe hypothesis is moderately well-supported.\n"
+        "**Confidence: 0.72** reflects solid but incomplete support."
+    )
+    obj = extract_json_object(raw)
+    assert obj == {"observer_confidence": 0.72, "evidence_assessments": []}
+
+
+def test_extract_json_object_ignores_trailing_fence_and_more_text():
+    raw = '```json\n{"a": 1}\n```\nSome trailing commentary.\n```\nmore\n```'
+    obj = extract_json_object(raw)
+    assert obj == {"a": 1}
+
+
+def test_extract_json_object_no_fence_with_trailing_prose():
+    raw = '{"a": 1}\n\nThis confidence reflects the evidence above.'
+    obj = extract_json_object(raw)
+    assert obj == {"a": 1}
+
+
+def test_extract_json_object_raises_on_no_json():
+    with pytest.raises(json.JSONDecodeError):
+        extract_json_object("no json here at all")
+
+
+def test_extract_json_object_nested_braces():
+    raw = '```json\n{"a": {"b": 1, "c": [1, 2, {"d": 3}]}}\n```\ntrailing text {with braces}'
+    obj = extract_json_object(raw)
+    assert obj == {"a": {"b": 1, "c": [1, 2, {"d": 3}]}}
 
 
 # --- MockLLMClient ---

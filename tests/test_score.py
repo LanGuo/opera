@@ -5,10 +5,44 @@ from reviewer.llm import MockLLMClient
 from reviewer.score import (
     score_run, score_run_all_backends, RunScores, _parse_json_criteria,
     _parse_json_agent_notes, _evidence_text, _format_evidence_trail,
-    _format_refuted_hypotheses, CriterionScore,
+    _format_refuted_hypotheses, _format_criteria_listing, CriterionScore,
 )
 
 MOCK_RESPONSE = "Score: 4/5\nOverall score: 16/20"
+
+
+# --- _format_criteria_listing ---
+
+def test_format_criteria_listing_includes_scale_1_to_5():
+    items = [{"id": "novelty", "label": "Novelty", "scale": "1-5", "guidance": "..."}]
+    listing = _format_criteria_listing(items)
+    assert "scale: 1-5" in listing
+
+
+def test_format_criteria_listing_includes_scale_yes_no_partial():
+    items = [{"id": "wet_lab_worthy", "label": "Worth pursuing", "scale": "yes/no/partial", "guidance": "..."}]
+    listing = _format_criteria_listing(items)
+    assert "scale: yes/no/partial" in listing
+
+
+def test_format_criteria_listing_defaults_scale_when_absent():
+    items = [{"id": "novelty", "label": "Novelty", "guidance": "..."}]
+    listing = _format_criteria_listing(items)
+    assert "scale: 1-5" in listing
+
+
+def test_format_criteria_listing_distinguishes_scales_per_criterion():
+    """The bug this guards: a numeric-scale criterion returned 'partial' in
+    practice because the model wasn't told which scale applied to which
+    criterion, only a generic example showing both formats."""
+    items = [
+        {"id": "experimental_design", "label": "Design", "scale": "1-5", "guidance": "..."},
+        {"id": "wet_lab_worthy", "label": "Worth it", "scale": "yes/no/partial", "guidance": "..."},
+    ]
+    listing = _format_criteria_listing(items)
+    design_block = listing.split("experimental_design")[1].split("wet_lab_worthy")[0]
+    assert "scale: 1-5" in design_block
+    assert "yes/no/partial" not in design_block
 
 
 @pytest.fixture

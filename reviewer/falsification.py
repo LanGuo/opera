@@ -2,7 +2,7 @@ import json
 import re
 from dataclasses import dataclass
 
-from reviewer.llm import LLMClient, get_llm_client
+from reviewer.llm import LLMClient, extract_json_object, get_llm_client
 
 _OBSERVER_SYSTEM = (
     "You are an independent scientific reviewer assessing evidence for a biological hypothesis. "
@@ -23,11 +23,71 @@ _OBSERVER_SYSTEM = (
 )
 
 _P_PATTERN = re.compile(r"p\s*[<=]+\s*([0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?)", re.IGNORECASE)
+# Diagnostic-performance percentages (sensitivity/specificity/accuracy/AUC) — common in
+# clinical-biomarker evidence but invisible to _P_PATTERN since no p-value is stated.
+_PERCENT_PATTERN = re.compile(
+    r"(sensitivity|specificity|accuracy|auc)\D{0,15}([0-9]{1,3}(?:\.[0-9]+)?)\s*%", re.IGNORECASE
+)
+# Named effect sizes (odds/hazard ratio, fold-change) given as a bare number, no p-value.
+_EFFECT_SIZE_PATTERN = re.compile(
+    r"\b(odds ratio|hazard ratio|fold-change|fold change|\bOR\b|\bHR\b)\D{0,10}([0-9]+(?:\.[0-9]+)?)",
+    re.IGNORECASE,
+)
+# Database interaction/confidence scores (e.g. STRING "combined score 0.83").
+_INTERACTION_SCORE_PATTERN = re.compile(
+    r"(combined score|interaction score|confidence score)\D{0,5}(0?\.[0-9]+)", re.IGNORECASE
+)
+# Caveat language that undercuts a hypothesis without using the original narrow
+# "contradict/refute/not significant/fail" wording — explicit specificity caveats are
+# common in this evidence (e.g. "CAUTION: ... is not SLE-specific").
+_CAUTION_KEYWORDS = (
+    "caution", "not specific", "non-specific", "nonspecific", "cross-react",
+    "cross reactiv", "not sle-specific", "no known natural substrate", "orphan",
+)
+_SUPPORTING_KEYWORDS = (
+    "support", "confirm", "significant", "enriched", "validated", "clonally expanded",
+    "associated with", "driver",
+)
+# Negated forms of the supporting keywords above, caught explicitly rather than relying
+# on keyword polarity alone — see _keyword_pattern's docstring for why a naive substring
+# check gets these backwards (e.g. "insignificant" contains "significant").
+_NEGATED_KEYWORDS = ("insignificant", "unsupported", "invalidated", "unconfirmed", "inconclusive")
+_CONTRADICTING_KEYWORDS = (
+    "contradict", "refute", "not significant", "fail"
+) + _NEGATED_KEYWORDS + _CAUTION_KEYWORDS
+
+
+def _keyword_pattern(keywords: tuple) -> re.Pattern:
+    """Compile keywords/phrases into one case-insensitive, start-anchored pattern.
+
+    Anchoring only the start of each keyword (\\b before, nothing after) means a
+    suffix still matches freely — "support" matches "supports"/"supported" — but a
+    negation prefix glued directly onto the word does NOT, since there is no word
+    boundary between it and the root (e.g. "insignificant" does not match
+    "significant"; "unsupported" does not match "support"; "invalidated" does not
+    match "validated"). A naive `keyword in text` substring check gets exactly these
+    cases backwards, silently flipping a negative finding into a supporting one.
+    """
+    alternation = "|".join(re.escape(k) for k in keywords)
+    return re.compile(r"\b(?:" + alternation + r")", re.IGNORECASE)
+
+
+_SUPPORTING_PATTERN = _keyword_pattern(_SUPPORTING_KEYWORDS)
+_CONTRADICTING_PATTERN = _keyword_pattern(_CONTRADICTING_KEYWORDS)
 
 # Threshold beyond which observer_confidence and e_value_confidence are considered
 # divergent enough to flag for downstream review. Not a correctness oracle — e_value_conf
 # is a rougher regex-based heuristic, not assumed to be more "correct" than the LLM's read.
 _DIVERGENCE_THRESHOLD = 0.2
+
+# Tolerance for comparing the LLM's self-reported observer_confidence against what its
+# OWN stated per-item e-values arithmetically multiply out to (E = prod(e_i), C = E/(1+E)).
+# Unlike _DIVERGENCE_THRESHOLD above (which compares against an independently-derived,
+# necessarily imperfect regex read of the raw text), this is pure math over numbers the
+# LLM itself already committed to — there is no legitimate "different but reasonable"
+# reading here. A gap beyond rounding noise means the LLM's final confidence number is
+# arithmetically inconsistent with the evidence weights it itself assigned.
+_AGGREGATION_TOLERANCE = 0.05
 
 
 @dataclass
@@ -49,6 +109,10 @@ class FalsificationResult:
     evidence_assessments: list[EvidenceAssessment]
     deterministic_delta: float = 0.0
     confidence_flagged: bool = False
+    llm_e_value_product: float = 1.0
+    llm_recomputed_confidence: float = 0.5
+    aggregation_delta: float = 0.0
+    aggregation_inconsistent: bool = False
 
 
 def _evidence_text(item) -> str:
@@ -59,13 +123,26 @@ def _evidence_text(item) -> str:
 
 
 def _extract_e_values_from_text(evidence: list) -> float:
-    """Compute e-value product from evidence items using regex-extracted p-values."""
+    """Compute e-value product from evidence items using regex-extracted quantitative signal.
+
+    Checks, in order: explicit p-value -> diagnostic-performance percentage
+    (sensitivity/specificity/accuracy/AUC) -> named effect size (OR/HR/fold-change) ->
+    database interaction/confidence score -> caution/caveat keywords (undercut the
+    hypothesis even without the original narrow "contradict" wording) -> generic
+    supporting keywords -> neutral default. This remains a heuristic text scan, not a
+    ground truth — it exists to sanity-check the LLM's self-reported confidence, not to
+    replace it.
+    """
     E = 1.0
     for item in evidence:
         text = _evidence_text(item)
-        match = _P_PATTERN.search(text)
-        if match:
-            p = float(match.group(1))
+        text_lower = text.lower()
+        p_match = _P_PATTERN.search(text)
+        pct_match = _PERCENT_PATTERN.search(text)
+        effect_match = _EFFECT_SIZE_PATTERN.search(text)
+        score_match = _INTERACTION_SCORE_PATTERN.search(text)
+        if p_match:
+            p = float(p_match.group(1))
             if p < 0.001:
                 e = 10.0
             elif p < 0.01:
@@ -76,15 +153,40 @@ def _extract_e_values_from_text(evidence: list) -> float:
                 e = 1.0
             else:
                 e = 0.5
-        elif any(w in text.lower() for w in ("support", "confirm", "significant", "enriched")):
+        elif pct_match:
+            pct = float(pct_match.group(2))
+            e = 3.0 if pct >= 90 else 2.0 if pct >= 70 else 1.5
+        elif effect_match:
+            e = 2.0
+        elif score_match:
             e = 1.5
-        elif any(w in text.lower() for w in ("contradict", "refute", "not significant", "fail")):
+        elif _CONTRADICTING_PATTERN.search(text_lower):
             e = 0.5
+        elif _SUPPORTING_PATTERN.search(text_lower):
+            e = 1.5
         else:
             e = 1.0
         E *= min(e, 10.0)
         E = min(E, 100.0)
     return E
+
+
+def _recompute_confidence_from_assessments(assessments: list) -> tuple[float, float]:
+    """Deterministically recompute E and C from the LLM's own stated per-item e-values.
+
+    This checks whether the LLM's self-reported observer_confidence is
+    arithmetically consistent with the e-values it assigned to the evidence —
+    a pure math check (prod -> ratio), independent of whether those e-values
+    are themselves well-chosen. It answers a different question than
+    e_value_confidence (which re-derives e-values from scratch via regex):
+    "did the model correctly aggregate the numbers it already committed to?"
+    """
+    E = 1.0
+    for a in assessments:
+        E *= min(max(a.e_value, 0.0), 10.0)
+    E = min(E, 100.0)
+    C = min(0.99, E / (1 + E))
+    return E, C
 
 
 def assess_hypothesis(hypothesis: dict, client: LLMClient) -> FalsificationResult:
@@ -109,9 +211,7 @@ def assess_hypothesis(hypothesis: dict, client: LLMClient) -> FalsificationResul
     e_product = _extract_e_values_from_text(evidence)
     e_value_conf = min(0.99, e_product / (1 + e_product))
     try:
-        # Strip markdown code fences if the model wrapped the JSON
-        cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text.strip())
-        parsed = json.loads(cleaned)
+        parsed = extract_json_object(raw_text)
     except (json.JSONDecodeError, ValueError) as exc:
         import sys
         print(f"  [falsification] WARNING: observer returned unparseable JSON for {h_id}: {exc}", file=sys.stderr)
@@ -165,6 +265,30 @@ def assess_hypothesis(hypothesis: dict, client: LLMClient) -> FalsificationResul
             file=sys.stderr,
         )
 
+    # Separately, verify the LLM's self-reported observer_conf is arithmetically
+    # consistent with the per-item e-values it itself assigned (not a re-derivation
+    # from text — a pure recomputation of E = prod(e_i), C = E/(1+E) from numbers
+    # the model already committed to in evidence_assessments). Skipped (not flagged)
+    # when the model returned no per-item breakdown to check against — that's a
+    # missing-data case, not an arithmetic inconsistency.
+    if assessments:
+        llm_e_product, llm_recomputed_conf = _recompute_confidence_from_assessments(assessments)
+        agg_delta = round(observer_conf - llm_recomputed_conf, 3)
+        agg_inconsistent = abs(agg_delta) > _AGGREGATION_TOLERANCE
+    else:
+        llm_e_product, llm_recomputed_conf = 1.0, 0.5
+        agg_delta = 0.0
+        agg_inconsistent = False
+    if agg_inconsistent:
+        import sys
+        print(
+            f"  [falsification] WARNING: observer's reported confidence is arithmetically "
+            f"inconsistent with its own stated e-values for {h_id} "
+            f"(reported={observer_conf:.2f}, recomputed-from-own-e-values={llm_recomputed_conf:.2f}, "
+            f"delta={agg_delta:+.2f})",
+            file=sys.stderr,
+        )
+
     return FalsificationResult(
         hypothesis_id=h_id,
         agent_confidence=agent_conf,
@@ -176,6 +300,10 @@ def assess_hypothesis(hypothesis: dict, client: LLMClient) -> FalsificationResul
         confidence_flagged=flagged,
         falsification_criteria=parsed.get("falsification_criteria", []),
         evidence_assessments=assessments,
+        llm_e_value_product=round(llm_e_product, 3),
+        llm_recomputed_confidence=round(llm_recomputed_conf, 3),
+        aggregation_delta=agg_delta,
+        aggregation_inconsistent=agg_inconsistent,
     )
 
 
