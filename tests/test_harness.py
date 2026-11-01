@@ -271,3 +271,14 @@ def test_summarize_separates_subagent_responses(tmp_path):
     _write(t, [main, sub, {"type": "result", "subtype": "success", "num_turns": 1, "modelUsage": {}}])
     s = summarize_transcript(t, "claude", requested_model="m")
     assert s["model_responses"] == 1 and s["subagent_responses"] == 1
+
+
+def test_summarize_claude_usage_is_cumulative_within_a_session(tmp_path):
+    # Claude Code reports modelUsage cumulatively within a session, so a resumed session's
+    # last result already holds the total; separate sessions add up.
+    t = tmp_path / "transcript.jsonl"
+    res = lambda sid, tokens: {"type": "result", "session_id": sid, "subtype": "success",  # noqa: E731
+                               "num_turns": 1, "modelUsage": {"m": {"inputTokens": tokens}}}
+    _write(t, [res("s1", 100), res("s1", 250), res("s2", 40)])
+    s = summarize_transcript(t, "claude", requested_model="m")
+    assert s["models_used"] == {"m": 290}

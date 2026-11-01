@@ -125,15 +125,18 @@ _GEMINI_PRICING = {
 
 
 def _parse_cost(transcript_path: Path) -> float | None:
-    """Extract run cost from the terminal 'result' event in a transcript.
+    """Extract run cost from the 'result' events in a transcript.
 
-    Claude transcripts include total_cost_usd directly.
-    Gemini transcripts include token counts per model in stats; we estimate
-    cost using _GEMINI_PRICING (first matching model substring wins).
+    Claude transcripts include total_cost_usd. A resumed session writes one result event per
+    invocation, each with the session's cumulative cost, so the last value per session is used and
+    sessions are summed. Gemini transcripts include token counts per model in stats; cost is
+    estimated with _GEMINI_PRICING (first matching model substring wins) from the first result.
     Returns None if no cost data found.
     """
     if not transcript_path.exists():
         return None
+    claude_costs: dict = {}
+    gemini_cost: float | None = None
     for line in transcript_path.read_text(encoding="utf-8").strip().splitlines():
         if not line:
             continue
@@ -143,12 +146,12 @@ def _parse_cost(transcript_path: Path) -> float | None:
             continue
         if event.get("type") != "result":
             continue
-        # Claude: direct cost field
         if "total_cost_usd" in event:
-            return float(event["total_cost_usd"])
-        # Gemini: compute from per-model token stats
-        stats = event.get("stats", {})
-        models = stats.get("models", {})
+            claude_costs[event.get("session_id")] = float(event["total_cost_usd"])
+            continue
+        if gemini_cost is not None:
+            continue
+        models = event.get("stats", {}).get("models", {})
         if models:
             total = 0.0
             for model_name, model_stats in models.items():
@@ -160,16 +163,19 @@ def _parse_cost(transcript_path: Path) -> float | None:
                 inp = model_stats.get("input", 0) or 0       # non-cached input tokens
                 out = model_stats.get("output_tokens", 0) or 0
                 total += inp / 1e6 * price[0] + out / 1e6 * price[1]
-            return total if total > 0 else None
-    return None
+            gemini_cost = total if total > 0 else None
+    if claude_costs:
+        return sum(claude_costs.values())
+    return gemini_cost
 
 
 def _parse_turn_count(transcript_path: Path) -> int | None:
     """Return the number of agent turns recorded in a transcript.
 
     Priority:
-    1. Claude Code result event: ``num_turns`` field is the authoritative count
-       written by the harness at run end (covers both streaming and -p mode).
+    1. Claude Code result events: ``num_turns`` is the authoritative count written by the
+       harness at the end of each invocation. A resumed session writes one result event per
+       invocation, each counting only that invocation's turns, so they are summed.
     2. Claude Code streaming: count ``message_start`` events (one per API call).
     3. Gemini CLI: count ``response`` events (one per turn).
     Returns None if the transcript does not exist or no turn signal is found.
@@ -178,6 +184,7 @@ def _parse_turn_count(transcript_path: Path) -> int | None:
         return None
     message_starts = 0
     gemini_responses = 0
+    result_turns: list[int] = []
     for line in transcript_path.read_text(encoding="utf-8").strip().splitlines():
         if not line:
             continue
@@ -187,11 +194,13 @@ def _parse_turn_count(transcript_path: Path) -> int | None:
             continue
         t = event.get("type")
         if t == "result" and "num_turns" in event:
-            return int(event["num_turns"])
+            result_turns.append(int(event["num_turns"]))
         elif t == "message_start":
             message_starts += 1
         elif t == "response":
             gemini_responses += 1
+    if result_turns:
+        return sum(result_turns)
     count = message_starts or gemini_responses
     return count if count > 0 else None
 

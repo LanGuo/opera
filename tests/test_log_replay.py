@@ -241,3 +241,43 @@ def test_analyze_run_includes_new_metrics(populated_run):
     assert hasattr(metrics, "martingale_score")
     assert hasattr(metrics, "directional_flip_count")
     assert isinstance(metrics.directional_flip_count, int)
+
+
+# --- turns and cost across resumed sessions ---
+
+import json as _json
+
+from reviewer.log_replay import _parse_cost, _parse_turn_count
+
+
+def _transcript(tmp_path, results):
+    p = tmp_path / "transcript.jsonl"
+    lines = []
+    for r in results:
+        lines.append(_json.dumps({"type": "system", "subtype": "init", "session_id": r["session"]}))
+        lines.append(_json.dumps({"type": "result", "session_id": r["session"],
+                                  "num_turns": r["turns"], "total_cost_usd": r["cost"]}))
+    p.write_text("\n".join(lines) + "\n")
+    return p
+
+
+def test_turns_single_session(tmp_path):
+    p = _transcript(tmp_path, [{"session": "s1", "turns": 31, "cost": 1.53}])
+    assert _parse_turn_count(p) == 31
+    assert _parse_cost(p) == pytest.approx(1.53)
+
+
+def test_turns_summed_and_cost_last_for_resumed_session(tmp_path):
+    # Claude Code reports num_turns per invocation but cost cumulatively within a session.
+    p = _transcript(tmp_path, [{"session": "s1", "turns": 31, "cost": 0.98},
+                               {"session": "s1", "turns": 31, "cost": 2.29},
+                               {"session": "s1", "turns": 17, "cost": 3.43}])
+    assert _parse_turn_count(p) == 79
+    assert _parse_cost(p) == pytest.approx(3.43)
+
+
+def test_cost_summed_across_different_sessions(tmp_path):
+    p = _transcript(tmp_path, [{"session": "s1", "turns": 10, "cost": 1.0},
+                               {"session": "s2", "turns": 5, "cost": 0.5}])
+    assert _parse_turn_count(p) == 15
+    assert _parse_cost(p) == pytest.approx(1.5)

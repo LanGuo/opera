@@ -182,8 +182,12 @@ def summarize_transcript(path, harness: str, requested_model: str) -> dict:
             for c in (r.get("message") or {}).get("content", []) or []
             if isinstance(c, dict) and c.get("type") == "tool_use"
         )
-        # Summed over segment records; a CLI that reports cumulative usage would be double counted.
+        # modelUsage is cumulative within a session (a resumed session repeats the running total),
+        # so take each session's last result and add sessions together.
+        last_by_session = {}
         for r in results:
+            last_by_session[r.get("session_id")] = r
+        for r in last_by_session.values():
             for m, u in (r.get("modelUsage") or {}).items():
                 models[m] = models.get(m, 0) + sum(
                     u.get(k, 0) or 0 for k in
