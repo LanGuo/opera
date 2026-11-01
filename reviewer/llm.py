@@ -46,7 +46,10 @@ def extract_json_object(raw: str) -> dict:
 class LLMClient:
     """Multi-backend LLM client. Use backend='anthropic', 'google', or 'ollama'."""
 
-    def __init__(self, backend: str, model: str, max_tokens: int = 4096, max_retries: int = 3):
+    def __init__(
+        self, backend: str, model: str, max_tokens: int = 4096, max_retries: int = 3,
+        temperature: float | None = None,
+    ):
         if backend not in ("anthropic", "google", "ollama"):
             raise ValueError(f"backend must be 'anthropic', 'google', or 'ollama', got {backend!r}")
         if backend == "ollama" and _ollama is None:
@@ -58,6 +61,11 @@ class LLMClient:
         self.model = model
         self._max_tokens = max_tokens
         self._max_retries = max_retries
+        # None leaves the provider's default sampling temperature in place.
+        self.temperature = temperature
+        # Model version the provider reports for the most recent response; an alias
+        # like "gemini-2.5-flash" can resolve to different snapshots over time.
+        self.last_model: str | None = None
 
         self._anthropic_client = _anthropic_sdk.Anthropic() if backend == "anthropic" else None
         self._google_client = _genai.Client(api_key=os.environ.get("GOOGLE_API_KEY")) if backend == "google" else None
@@ -102,8 +110,11 @@ class LLMClient:
         kwargs: dict = dict(model=self.model, max_tokens=self._max_tokens, messages=user_messages)
         if system is not None:
             kwargs["system"] = system
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
         assert self._anthropic_client is not None
         msg = self._anthropic_client.messages.create(**kwargs)
+        self.last_model = getattr(msg, "model", None) or self.model
         return msg.content[0].text if msg.content else ""
 
     def _chat_google(self, messages: list[dict], schema: dict | None) -> str:
@@ -119,6 +130,8 @@ class LLMClient:
                 contents.append(_genai.types.Content(role=role, parts=[_genai.types.Part(text=m["content"])]))
 
         config: dict = {"max_output_tokens": self._max_tokens}
+        if self.temperature is not None:
+            config["temperature"] = self.temperature
         if system:
             config["system_instruction"] = system
         if schema:
@@ -130,6 +143,7 @@ class LLMClient:
             contents=contents,
             config=_genai.types.GenerateContentConfig(**config)
         )
+        self.last_model = getattr(resp, "model_version", None) or self.model
         return resp.text
 
     def _chat_ollama(self, messages: list[dict], schema: dict | None) -> str:
@@ -137,7 +151,10 @@ class LLMClient:
         kwargs: dict = dict(model=self.model, messages=messages)
         if schema is not None:
             kwargs["format"] = schema
+        if self.temperature is not None:
+            kwargs["options"] = {"temperature": self.temperature}
         resp = _ollama.chat(**kwargs)
+        self.last_model = resp.get("model") or self.model
         return resp["message"]["content"]
 
 
@@ -152,12 +169,17 @@ class MockLLMClient:
         self._responses = [response] if isinstance(response, str) else list(response)
         self.call_count = 0
         self.calls: list[list[dict]] = []
+        self.last_model: str | None = None
 
     def chat(self, messages: list[dict], schema: dict | None = None) -> str:
         self.calls.append(messages)
+        self.last_model = "mock"
         idx = min(self.call_count, len(self._responses) - 1)
         self.call_count += 1
         return self._responses[idx] if self._responses else ""
+
+
+DEFAULT_MODELS = {"anthropic": "claude-haiku-4-5", "google": "gemini-2.5-flash"}
 
 
 def get_llm_client() -> LLMClient:
@@ -168,11 +190,11 @@ def get_llm_client() -> LLMClient:
     model_override = os.environ.get("LLM_MODEL")
 
     if os.environ.get("ANTHROPIC_API_KEY"):
-        model = model_override or "claude-haiku-4-5"
+        model = model_override or DEFAULT_MODELS["anthropic"]
         return LLMClient(backend="anthropic", model=model)
 
     if os.environ.get("GOOGLE_API_KEY"):
-        model = model_override or "gemini-2.5-flash"
+        model = model_override or DEFAULT_MODELS["google"]
         return LLMClient(backend="google", model=model)
 
     ollama_model = os.environ.get("OLLAMA_MODEL")

@@ -424,6 +424,16 @@ def score_run(run_dir: str, client: LLMClient | None = None) -> RunScores:
     )
 
 
+# Shared with reviewer.variability so repeat experiments use the production judge settings.
+JUDGE_BACKEND_MODELS = {"anthropic": "claude-haiku-4-5", "google": "gemini-2.5-flash"}
+
+# JSON output (criterion_id/score/rationale repeated per entry, quoted and
+# escaped) runs noticeably longer than the old free-text format did for the
+# same content -- bump past the client's 4096 default so a detailed multi-
+# criterion response doesn't get truncated mid-JSON.
+JUDGE_MAX_TOKENS = 8192
+
+
 def score_run_all_backends(run_dir: str) -> dict[str, RunScores]:
     """Score a run with all configured LLM backends.
 
@@ -437,16 +447,11 @@ def score_run_all_backends(run_dir: str) -> dict[str, RunScores]:
     """
     backends: list[tuple[str, LLMClient]] = []
 
-    # JSON output (criterion_id/score/rationale repeated per entry, quoted and
-    # escaped) runs noticeably longer than the old free-text format did for the
-    # same content -- bump past the client's 4096 default so a detailed multi-
-    # criterion response doesn't get truncated mid-JSON.
-    JUDGE_MAX_TOKENS = 8192
-
     if os.environ.get("ANTHROPIC_API_KEY"):
         try:
             backends.append(("anthropic", LLMClient(
-                backend="anthropic", model="claude-haiku-4-5", max_tokens=JUDGE_MAX_TOKENS,
+                backend="anthropic", model=JUDGE_BACKEND_MODELS["anthropic"],
+                max_tokens=JUDGE_MAX_TOKENS,
             )))
         except Exception as exc:
             print(f"[score] skipping anthropic backend: {exc}", file=sys.stderr)
@@ -454,7 +459,8 @@ def score_run_all_backends(run_dir: str) -> dict[str, RunScores]:
     if os.environ.get("GOOGLE_API_KEY"):
         try:
             backends.append(("google", LLMClient(
-                backend="google", model="gemini-2.5-flash", max_tokens=JUDGE_MAX_TOKENS,
+                backend="google", model=JUDGE_BACKEND_MODELS["google"],
+                max_tokens=JUDGE_MAX_TOKENS,
             )))
         except Exception as exc:
             print(f"[score] skipping google backend: {exc}", file=sys.stderr)

@@ -113,6 +113,8 @@ class FalsificationResult:
     llm_recomputed_confidence: float = 0.5
     aggregation_delta: float = 0.0
     aggregation_inconsistent: bool = False
+    # True when the observer's response couldn't be parsed and observer_confidence is the 0.5 fallback.
+    parse_failed: bool = False
 
 
 def _evidence_text(item) -> str:
@@ -237,6 +239,7 @@ def assess_hypothesis(hypothesis: dict, client: LLMClient) -> FalsificationResul
             confidence_flagged=fallback_flagged,
             falsification_criteria=[],
             evidence_assessments=[],
+            parse_failed=True,
         )
 
     assessments = [

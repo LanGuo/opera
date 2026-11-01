@@ -343,3 +343,14 @@ def test_assess_terminal_hypotheses_raises_without_backend(tmp_path, monkeypatch
     Workspace(str(tmp_path / "run_001"))
     with pytest.raises(ValueError, match="ANTHROPIC_API_KEY"):
         assess_terminal_hypotheses(str(tmp_path / "run_001"))
+
+
+def test_assess_hypothesis_marks_parse_failure():
+    """An unparseable response falls back to 0.5; the result must say so, so 0.5 isn't read as a real estimate."""
+    r = assess_hypothesis(MOCK_HYPOTHESIS, MockLLMClient("not json at all"))
+    assert r.parse_failed is True
+    assert r.observer_confidence == 0.5
+
+
+def test_assess_hypothesis_parse_ok_not_marked():
+    assert assess_hypothesis(MOCK_HYPOTHESIS, MockLLMClient(MOCK_OBSERVER_RESPONSE)).parse_failed is False

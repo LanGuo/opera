@@ -211,6 +211,10 @@ def _radio_group(name: str, options: list) -> str:
     return '<div class="radio-group">' + "".join(parts) + "</div>"
 
 
+# A criterion is "contested" when judge backends' numeric scores differ by at least this much.
+CONTESTED_SCORE_GAP = 2
+
+
 def _safe_json(obj) -> str:
     return json.dumps(obj).replace("</", "<\\/")
 
@@ -660,11 +664,10 @@ def _render_locked(data: dict, falsification_scores_html: str = "") -> str:
                         if m:
                             criterion_backend_nums.setdefault(cid, {})[backend_key] = int(m.group(1))
 
-                # Determine contested criteria (differ by >=2 across backends)
                 contested_criteria: set = set()
                 for cid, bmap in criterion_backend_nums.items():
                     nums = list(bmap.values())
-                    if len(nums) >= 2 and (max(nums) - min(nums)) >= 2:
+                    if len(nums) >= 2 and (max(nums) - min(nums)) >= CONTESTED_SCORE_GAP:
                         contested_criteria.add(cid)
 
                 per_hyp_html = ""

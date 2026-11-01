@@ -95,6 +95,7 @@ def test_get_llm_client_uses_lm_model_override(monkeypatch):
 
 def test_get_llm_client_ollama(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.setenv("OLLAMA_MODEL", "gemma4:e4b")
     with patch("reviewer.llm._ollama", MagicMock()):
         c = get_llm_client()
@@ -247,3 +248,79 @@ def test_ollama_chat_omits_format_when_no_schema():
         c = LLMClient(backend="ollama", model="gemma4:e4b")
         c.chat([{"role": "user", "content": "hi"}])
     assert "format" not in mock_ollama.chat.call_args[1]
+
+
+# --- temperature and returned-model recording ---
+
+from types import SimpleNamespace
+from reviewer.llm import LLMClient
+
+
+def _anthropic_client_with_fake(monkeypatch, temperature):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    c = LLMClient(backend="anthropic", model="claude-haiku-4-5", temperature=temperature)
+    fake = MagicMock()
+    fake.messages.create.return_value = SimpleNamespace(
+        content=[SimpleNamespace(text="hi")], model="claude-haiku-4-5-20251001"
+    )
+    c._anthropic_client = fake
+    return c, fake
+
+
+def test_anthropic_passes_temperature_when_set(monkeypatch):
+    c, fake = _anthropic_client_with_fake(monkeypatch, 0.0)
+    assert c.chat([{"role": "user", "content": "x"}]) == "hi"
+    assert fake.messages.create.call_args.kwargs["temperature"] == 0.0
+
+
+def test_anthropic_omits_temperature_by_default(monkeypatch):
+    c, fake = _anthropic_client_with_fake(monkeypatch, None)
+    c.chat([{"role": "user", "content": "x"}])
+    assert "temperature" not in fake.messages.create.call_args.kwargs
+
+
+def test_anthropic_records_returned_model(monkeypatch):
+    c, _ = _anthropic_client_with_fake(monkeypatch, None)
+    assert c.last_model is None
+    c.chat([{"role": "user", "content": "x"}])
+    assert c.last_model == "claude-haiku-4-5-20251001"
+
+
+def test_google_passes_temperature_and_records_model_version(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "api-test")
+    c = LLMClient(backend="google", model="gemini-2.5-flash", temperature=0.0)
+    fake = MagicMock()
+    fake.models.generate_content.return_value = SimpleNamespace(
+        text="ok", model_version="gemini-2.5-flash-001"
+    )
+    c._google_client = fake
+    assert c.chat([{"role": "user", "content": "x"}]) == "ok"
+    assert fake.models.generate_content.call_args.kwargs["config"].temperature == 0.0
+    assert c.last_model == "gemini-2.5-flash-001"
+
+
+def test_google_omits_temperature_by_default(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "api-test")
+    c = LLMClient(backend="google", model="gemini-2.5-flash")
+    fake = MagicMock()
+    fake.models.generate_content.return_value = SimpleNamespace(text="ok", model_version=None)
+    c._google_client = fake
+    c.chat([{"role": "user", "content": "x"}])
+    assert fake.models.generate_content.call_args.kwargs["config"].temperature is None
+    assert c.last_model == "gemini-2.5-flash"
+
+
+def test_ollama_passes_temperature_option():
+    fake = MagicMock()
+    fake.chat.return_value = {"message": {"content": "ok"}, "model": "gemma4:e4b"}
+    with patch("reviewer.llm._ollama", fake):
+        c = LLMClient(backend="ollama", model="gemma4:e4b", temperature=0.0)
+        assert c.chat([{"role": "user", "content": "x"}]) == "ok"
+    assert fake.chat.call_args.kwargs["options"] == {"temperature": 0.0}
+    assert c.last_model == "gemma4:e4b"
+
+
+def test_mock_client_reports_last_model():
+    m = MockLLMClient("x")
+    m.chat([{"role": "user", "content": "y"}])
+    assert m.last_model == "mock"
