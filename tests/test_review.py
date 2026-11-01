@@ -444,7 +444,9 @@ from reviewer.review import main as review_main
 
 
 def test_main_writes_review_html(run_with_data, monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    # Clear every LLM backend so the test never makes real, paid API calls.
+    for var in ("ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_MODEL"):
+        monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr("sys.argv", ["review", run_with_data])
     review_main()
     html_files = list(Path(run_with_data).glob("review_*.html"))
@@ -456,7 +458,9 @@ def test_main_writes_review_html(run_with_data, monkeypatch):
 
 
 def test_main_creates_new_file_each_run(run_with_data, monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    # Clear every LLM backend so the test never makes real, paid API calls.
+    for var in ("ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "OLLAMA_MODEL"):
+        monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr("sys.argv", ["review", run_with_data])
     review_main()
     review_main()

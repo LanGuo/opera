@@ -17,6 +17,7 @@ import hashlib
 import json
 import re
 import statistics
+import subprocess
 import sys
 import threading
 import time
@@ -28,6 +29,7 @@ from pathlib import Path
 
 from reviewer.falsification import assess_terminal_hypotheses
 from reviewer.llm import DEFAULT_MODELS, LLMClient
+from reviewer.prompt_variants import VARIANTS, get_variant
 from reviewer.review import CONTESTED_SCORE_GAP
 from reviewer.score import JUDGE_BACKEND_MODELS, JUDGE_MAX_TOKENS, score_run
 
@@ -71,8 +73,22 @@ def default_client_factory(component: str, backend: str, temperature: float | No
     )
 
 
-def _arm_name(temperature: float | None) -> str:
-    return "default" if temperature is None else f"temp{temperature}"
+def _code_version() -> dict:
+    """Commit of the repo this code runs from, and whether tracked files differ from it."""
+    repo = Path(__file__).resolve().parent.parent
+
+    def git(*args):
+        r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+        return r.stdout.strip() if r.returncode == 0 else None
+
+    commit = git("rev-parse", "HEAD")
+    status = git("status", "--porcelain", "--untracked-files=no")
+    return {"code_commit": commit, "code_dirty": None if status is None else bool(status)}
+
+
+def _arm_name(temperature: float | None, prompt_variant: str = "original") -> str:
+    base = "default" if temperature is None else f"temp{temperature}"
+    return base if prompt_variant == "original" else f"{base}-{prompt_variant}"
 
 
 def _key(rec: dict) -> tuple:
@@ -100,10 +116,13 @@ def _judge_result(scores) -> dict:
     }
 
 
-def _run_unit(run_dir, component, backend, repeat, *, temperature, arm, client_factory) -> dict:
+def _run_unit(
+    run_dir, component, backend, repeat, *, temperature, arm, client_factory, prompt_variant,
+) -> dict:
     rec = {
         "run_id": Path(run_dir).name, "run_dir": str(run_dir), "component": component,
         "backend": backend, "arm": arm, "temperature": temperature, "repeat": repeat,
+        "prompt_variant": prompt_variant,
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
     client = None
@@ -112,9 +131,13 @@ def _run_unit(run_dir, component, backend, repeat, *, temperature, arm, client_f
         rec["model_requested"] = getattr(inner, "model", None)
         client = RecordingClient(inner)
         if component == "judge":
-            rec["result"] = _judge_result(score_run(str(run_dir), client=client))
+            rec["result"] = _judge_result(
+                score_run(str(run_dir), client=client, prompt_variant=prompt_variant)
+            )
         else:
-            rec["result"] = [asdict(r) for r in assess_terminal_hypotheses(str(run_dir), client)]
+            rec["result"] = [
+                asdict(r) for r in assess_terminal_hypotheses(str(run_dir), client, prompt_variant)
+            ]
         rec["ok"] = True
     except Exception as exc:
         rec["ok"] = False
@@ -136,6 +159,7 @@ def run_repeats(
     arm: str | None = None,
     components: tuple[str, ...] = ("judge", "observer"),
     backends: tuple[str, ...] = ("anthropic", "google"),
+    prompt_variant: str = "original",
 ) -> int:
     """Run every missing (run, component, backend, repeat) unit and append one record each.
 
@@ -146,7 +170,8 @@ def run_repeats(
     for run_dir in run_dirs:
         if not (Path(run_dir) / "ledger.json").is_file():
             raise FileNotFoundError(f"not a run directory (no ledger.json): {run_dir}")
-    arm = arm or _arm_name(temperature)
+    get_variant(prompt_variant)  # fail before any call on an unknown name
+    arm = arm or _arm_name(temperature, prompt_variant)
     done = {_key(r) for r in load_records(out_path) if r.get("ok")}
     units = []
     for run_dir in run_dirs:
@@ -158,9 +183,14 @@ def run_repeats(
 
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     lock = threading.Lock()
+    version = _code_version()
 
     def work(unit):
-        rec = _run_unit(*unit, temperature=temperature, arm=arm, client_factory=client_factory)
+        rec = _run_unit(
+            *unit, temperature=temperature, arm=arm, client_factory=client_factory,
+            prompt_variant=prompt_variant,
+        )
+        rec.update(version)
         with lock, open(out_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec) + "\n")
         return rec
@@ -417,6 +447,86 @@ def summarize(records: list[dict], human_scores: dict | None = None) -> dict:
     }
 
 
+def compare(records: list[dict], baseline_arm: str) -> dict:
+    """Check each other arm's scores against the baseline arm's repeat-to-repeat range.
+
+    A variant value outside [min, max] of the baseline's repeats on the same run, backend,
+    hypothesis, and criterion is a change the baseline's own noise doesn't cover.
+    """
+    latest: dict[tuple, dict] = {}
+    for r in records:
+        if r.get("ok"):
+            latest[_key(r)] = r
+
+    judge_vals: dict[tuple, list[int]] = defaultdict(list)  # (arm, run, backend, hid, cid)
+    for r in latest.values():
+        if r["component"] != "judge":
+            continue
+        for hid, crit in _per_hypothesis_numeric(r).items():
+            for cid, v in crit.items():
+                judge_vals[(r["arm"], r["run_id"], r["backend"], hid, cid)].append(v)
+        for cr in r["result"]["overall_criteria"]:
+            if (v := _numeric(cr["score"])) is not None:
+                judge_vals[(r["arm"], r["run_id"], r["backend"], "(overall)", cr["criterion_id"])].append(v)
+
+    genes = {
+        (r["run_id"], h["hypothesis_id"]): h["candidate_gene"]
+        for r in latest.values() if r["component"] == "judge"
+        for h in r["result"]["hypotheses"] if h.get("candidate_gene")
+    }
+    obs_vals: dict[tuple, list[float]] = defaultdict(list)  # (arm, run, hid)
+    for r in latest.values():
+        if r["component"] != "observer":
+            continue
+        for res in r["result"]:
+            if not res.get("parse_failed"):
+                obs_vals[(r["arm"], r["run_id"], res["hypothesis_id"])].append(res["observer_confidence"])
+
+    def rows(values: dict, group_len: int) -> list[dict]:
+        groups: dict[tuple, dict] = {}
+        for key, vals in sorted(values.items()):
+            arm, rest = key[0], key[1:]
+            if arm == baseline_arm or (baseline_arm,) + rest not in values:
+                continue
+            base = values[(baseline_arm,) + rest]
+            g = groups.setdefault((arm,) + rest[:group_len], {"n_criteria": 0, "outside": []})
+            g["n_criteria"] += 1
+            if min(vals) < min(base) or max(vals) > max(base):
+                hid = rest[group_len] if len(rest) > group_len else None
+                g["outside"].append({
+                    "hypothesis_id": hid,
+                    "candidate_gene": genes.get((rest[0], hid)),
+                    "criterion_id": rest[group_len + 1] if len(rest) > group_len + 1 else None,
+                    "baseline_range": [min(base), max(base)],
+                    "variant_values": sorted(vals),
+                })
+        return [{"arm": k[0], "run_id": k[1], **({"backend": k[2]} if group_len == 2 else {}),
+                 "n_criteria": g["n_criteria"], "n_outside": len(g["outside"]), "outside": g["outside"]}
+                for k, g in groups.items()]
+
+    return {"baseline_arm": baseline_arm, "judge": rows(judge_vals, 2), "observer": rows(obs_vals, 1)}
+
+
+def format_compare(c: dict) -> str:
+    lines = [f"Compared against the baseline arm {c['baseline_arm']!r}: a value counts as outside "
+             f"when it falls beyond the baseline repeats' min-max range."]
+    lines.append("\n=== Judge criterion scores ===")
+    for r in c["judge"]:
+        lines.append(f"{r['arm']:16} {r['run_id']} {r['backend']:9} "
+                     f"{r['n_outside']}/{r['n_criteria']} criteria outside")
+        for o in r["outside"]:
+            lines.append(f"    {o['candidate_gene'] or o['hypothesis_id']} {o['criterion_id']}: "
+                         f"baseline {o['baseline_range']}, "
+                         f"variant {o['variant_values']}")
+    lines.append("\n=== Observer confidence ===")
+    for r in c["observer"]:
+        lines.append(f"{r['arm']:16} {r['run_id']} {r['n_outside']}/{r['n_criteria']} hypotheses outside")
+        for o in r["outside"]:
+            lines.append(f"    {o['candidate_gene'] or o['hypothesis_id']}: baseline {o['baseline_range']}, "
+                         f"variant {o['variant_values']}")
+    return "\n".join(lines)
+
+
 def _label(stable: bool | None) -> str:
     return {True: "STABLE", False: "unstable", None: f"(n<{MIN_REPEATS}, no verdict)"}[stable]
 
@@ -492,11 +602,19 @@ def main(argv: list[str] | None = None) -> None:
     run_p.add_argument("--repeats", type=int, default=10)
     run_p.add_argument("--temperature", type=float, default=None,
                        help="sampling temperature; omit for the provider default")
-    run_p.add_argument("--arm", default=None, help="arm label (default: derived from temperature)")
+    run_p.add_argument("--arm", default=None,
+                       help="arm label (default: derived from temperature and prompt variant)")
+    run_p.add_argument("--prompt-variant", default="original", choices=sorted(VARIANTS),
+                       help="instruction wording (reviewer.prompt_variants); default is production")
     run_p.add_argument("--components", nargs="+", default=["judge", "observer"], choices=["judge", "observer"])
     run_p.add_argument("--backends", nargs="+", default=["anthropic", "google"],
                        choices=sorted(JUDGE_BACKEND_MODELS))
     run_p.add_argument("--workers", type=int, default=4)
+
+    cmp_p = sub.add_parser("compare", help="check other arms against a baseline arm's range")
+    cmp_p.add_argument("path")
+    cmp_p.add_argument("--baseline", required=True, help="baseline arm, e.g. temp0.0")
+    cmp_p.add_argument("--json", default=None, help="also write the comparison as JSON here")
 
     sum_p = sub.add_parser("summarize", help="summarize a variability JSONL file")
     sum_p.add_argument("path")
@@ -508,11 +626,18 @@ def main(argv: list[str] | None = None) -> None:
             args.run_dirs, args.repeats, args.out, workers=args.workers,
             temperature=args.temperature, arm=args.arm,
             components=tuple(args.components), backends=tuple(args.backends),
+            prompt_variant=args.prompt_variant,
         )
         print(f"[variability] attempted {n} units -> {args.out}", file=sys.stderr)
         return
 
     records = load_records(args.path)
+    if args.cmd == "compare":
+        result = compare(records, args.baseline)
+        print(format_compare(result))
+        if args.json:
+            Path(args.json).write_text(json.dumps(result, indent=2), encoding="utf-8")
+        return
     human = {r["run_id"]: load_human_scores(r["run_dir"]) for r in records}
     summary = summarize(records, human_scores={k: v for k, v in human.items() if v})
     print(format_summary(summary))

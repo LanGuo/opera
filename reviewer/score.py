@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 
 from hypothesis_ledger.workspace import Workspace
 from reviewer.llm import LLMClient, extract_json_object, get_llm_client
+from reviewer.prompt_variants import PromptVariant, get_variant
 
 
 @dataclass
@@ -69,30 +70,10 @@ Novelty score: X/5
 Significance score: X/5
 """
 
-_BIAS_PREAMBLE = (
-    "Score based solely on the information provided below — do not query external databases, "
-    "verify claims via search, or use any tools. Do not reward length, confidence of language, "
-    "or presentation style — only scientific content and rigor."
-)
-
-# Shared JSON-output contract for both pass-1 scoring calls (per-hypothesis and overall).
-# Free-text output ("Score: X/5" lines) proved unreliable to parse back out: judge models
-# inconsistently wrapped it in markdown, restructured pass-2 responses entirely, or used
-# numbered sub-lists inside a criterion's own rationale that collided with the block
-# splitter. JSON has no such ambiguity — the model's prose lives inside string values,
-# never in a position that could be mistaken for a structural boundary.
-_JSON_PASS1_INSTRUCTION = (
-    '\nReturn ONLY a JSON object with no markdown code fence, matching this shape:\n'
-    '{{"criteria": [{{"criterion_id": <str>, "score": <str, e.g. "4/5" or "yes/no/partial">, '
-    '"rationale": <str, 2-3 sentences>}}, ...]}}\n'
-    'Include exactly one entry per criterion below, using the exact criterion_id given for each.\n'
-)
-
-_JSON_PASS2_INSTRUCTION = (
-    '\nReturn ONLY a JSON object with no markdown code fence, matching this shape:\n'
-    '{"agent_notes": [{"criterion_id": <str>, "agent_note": <str, 1-2 sentences>}, ...]}\n'
-    "Include one entry per criterion_id listed above — do not restate scores or rationale."
-)
+# Instruction wording (role, bias rules, JSON output contract) lives in reviewer.prompt_variants.
+# The judge answers in JSON because free text ("Score: X/5" lines) proved unreliable to parse:
+# models wrapped it in markdown, restructured pass-2 responses, or used numbered sub-lists that
+# collided with the block splitter. In JSON the model's prose stays inside string values.
 
 
 def _evidence_text(item, default_type: str = "unknown") -> tuple[str, str]:
@@ -161,11 +142,11 @@ def _format_criteria_listing(items: list) -> str:
 
 def _build_per_hypothesis_prompt_pass1(
     goal: str, per_items: list, hypothesis_str: str, evidence_str: str,
-    validation: str, evidence_trail: str, open_questions_str: str,
+    validation: str, evidence_trail: str, open_questions_str: str, v: PromptVariant,
 ) -> str:
     parts = [
         f"Task goal: {goal}\n",
-        f"You are scoring a completed AI agent evaluation run. {_BIAS_PREAMBLE}\n",
+        f"{v.judge_role}\n",
         f"Hypothesis: {hypothesis_str}",
         f"Final evidence:\n{evidence_str}",
     ]
@@ -175,31 +156,30 @@ def _build_per_hypothesis_prompt_pass1(
         parts.append(open_questions_str)
     if validation:
         parts.append(f"Proposed validation: {validation}")
-    parts.append(_JSON_PASS1_INSTRUCTION)
+    parts.append(v.judge_pass1_format)
     parts.append(_format_criteria_listing(per_items))
     return "\n\n".join(parts)
 
 
 def _build_per_hypothesis_prompt_pass2(
-    criteria: list["CriterionScore"], agent_rationale: str,
+    criteria: list["CriterionScore"], agent_rationale: str, v: PromptVariant,
 ) -> str:
     scores_summary = "\n".join(f"- {c.criterion_id}: {c.score} — {c.rationale}" for c in criteria)
     return (
-        "You just scored this hypothesis based on observed evidence:\n"
+        f"{v.judge_pass2_hyp_lead}\n"
         f"{scores_summary}\n\n"
-        "Now review the agent's own rationale for the same hypothesis and note where your "
-        "independent assessment agrees or diverges, for each criterion above.\n\n"
+        f"{v.judge_pass2_hyp_task}\n\n"
         f"Agent's rationale for the final belief update:\n{agent_rationale}"
-        f"{_JSON_PASS2_INSTRUCTION}"
+        f"{v.judge_pass2_format}"
     )
 
 
 def _build_overall_prompt_pass1(
-    goal: str, overall_items: list, metrics: dict, refuted_str: str,
+    goal: str, overall_items: list, metrics: dict, refuted_str: str, v: PromptVariant,
 ) -> str:
     parts = [
         f"Task goal: {goal}\n",
-        f"You are scoring a completed AI agent evaluation run. {_BIAS_PREAMBLE}\n",
+        f"{v.judge_role}\n",
         "Run summary:",
         f"  Hypotheses formed: {metrics['hypothesis_count']}",
         f"  Belief revisions: {metrics['belief_revision_count']}",
@@ -207,23 +187,23 @@ def _build_overall_prompt_pass1(
     ]
     if refuted_str:
         parts.append(f"\n{refuted_str}")
-    parts.append(_JSON_PASS1_INSTRUCTION)
+    parts.append(v.judge_pass1_format)
     parts.append(_format_criteria_listing(overall_items))
     return "\n\n".join(parts)
 
 
 def _build_overall_prompt_pass2(
     criteria: list["CriterionScore"], termination_rationale: str, confidence_summary: str,
+    v: PromptVariant,
 ) -> str:
     scores_summary = "\n".join(f"- {c.criterion_id}: {c.score} — {c.rationale}" for c in criteria)
     return (
-        "You just scored the overall run quality based on observed metrics:\n"
+        f"{v.judge_pass2_overall_lead}\n"
         f"{scores_summary}\n\n"
-        "Now review the agent's own termination rationale and confidence summary, and note "
-        "where your independent assessment agrees or diverges, for each criterion above.\n\n"
+        f"{v.judge_pass2_overall_task}\n\n"
         f"Agent's termination rationale:\n{termination_rationale}\n\n"
         f"Agent's confidence summary:\n{confidence_summary}"
-        f"{_JSON_PASS2_INSTRUCTION}"
+        f"{v.judge_pass2_format}"
     )
 
 
@@ -300,7 +280,11 @@ def _score_criteria_two_pass(
     return raw_display, criteria
 
 
-def score_run(run_dir: str, client: LLMClient | None = None) -> RunScores:
+def score_run(
+    run_dir: str, client: LLMClient | None = None, prompt_variant: str = "original",
+) -> RunScores:
+    """Score a completed run. prompt_variant selects instruction wording (reviewer.prompt_variants)."""
+    v = get_variant(prompt_variant)
     ws = Workspace(run_dir)
     if not ws.final_report_path.exists():
         raise FileNotFoundError(f"No final_report.json in {run_dir}. Run must be completed.")
@@ -354,10 +338,10 @@ def score_run(run_dir: str, client: LLMClient | None = None) -> RunScores:
             if per_items:
                 prompt1 = _build_per_hypothesis_prompt_pass1(
                     goal, per_items, hypothesis_str, evidence_str,
-                    validation, evidence_trail, open_questions_str,
+                    validation, evidence_trail, open_questions_str, v,
                 )
                 build_prompt2 = (
-                    (lambda crit: _build_per_hypothesis_prompt_pass2(crit, agent_rationale))
+                    (lambda crit: _build_per_hypothesis_prompt_pass2(crit, agent_rationale, v))
                     if agent_rationale else None
                 )
                 per_hyp_raw, criteria = _score_criteria_two_pass(
@@ -383,9 +367,9 @@ def score_run(run_dir: str, client: LLMClient | None = None) -> RunScores:
                     1 for h in top_hypotheses if h.get("status") == "refuted"
                 ) / max(n_hyps, 1),
             }
-            prompt1 = _build_overall_prompt_pass1(goal, overall_items, metrics_summary, refuted_str)
+            prompt1 = _build_overall_prompt_pass1(goal, overall_items, metrics_summary, refuted_str, v)
             build_prompt2 = (
-                (lambda crit: _build_overall_prompt_pass2(crit, termination_rationale, confidence_summary))
+                (lambda crit: _build_overall_prompt_pass2(crit, termination_rationale, confidence_summary, v))
                 if (termination_rationale or confidence_summary) else None
             )
             overall_raw, overall_criteria = _score_criteria_two_pass(

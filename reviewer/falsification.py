@@ -3,24 +3,7 @@ import re
 from dataclasses import dataclass
 
 from reviewer.llm import LLMClient, extract_json_object, get_llm_client
-
-_OBSERVER_SYSTEM = (
-    "You are an independent scientific reviewer assessing evidence for a biological hypothesis. "
-    "You will NOT be told the researcher's confidence estimate — form your own. "
-    "For each evidence item, extract any quantitative value (p-value, fold-change, odds ratio) "
-    "if explicitly stated in the text. "
-    "Return ONLY a JSON object with no markdown wrapper: "
-    '{"observer_confidence": <float 0-1>, '
-    '"evidence_assessments": [{"source": <str>, "e_value": <float>, "reasoning": <str>}], '
-    '"falsification_criteria": [<str>, <str>, <str>]} '
-    "where e_value > 1 means evidence supporting the hypothesis, "
-    "e_value < 1 means evidence against, e_value = 1 means neutral. "
-    "Calibrated scale: p<0.001→e=10, p<0.01→e=5, p<0.05→e=2, "
-    "p>0.1→e=0.5, supporting text (no p-value)→e=1.5, neutral→e=1.0, contradicting→e=0.5. "
-    "Cap individual e_values at 10. "
-    "Set observer_confidence = min(0.99, E_product / (1 + E_product)) "
-    "where E_product is the product of all e_values (capped at 100)."
-)
+from reviewer.prompt_variants import get_variant, observer_system
 
 _P_PATTERN = re.compile(r"p\s*[<=]+\s*([0-9]+(?:\.[0-9]+)?(?:e[+-]?[0-9]+)?)", re.IGNORECASE)
 # Diagnostic-performance percentages (sensitivity/specificity/accuracy/AUC) — common in
@@ -191,8 +174,11 @@ def _recompute_confidence_from_assessments(assessments: list) -> tuple[float, fl
     return E, C
 
 
-def assess_hypothesis(hypothesis: dict, client: LLMClient) -> FalsificationResult:
+def assess_hypothesis(
+    hypothesis: dict, client: LLMClient, prompt_variant: str = "original",
+) -> FalsificationResult:
     """Run observer LLM on one hypothesis's evidence. Returns statistically grounded confidence."""
+    system = observer_system(get_variant(prompt_variant))
     h_id = hypothesis.get("hypothesis_id", "unknown")
     agent_conf = hypothesis.get("confidence")
     gene = hypothesis.get("candidate_gene", "")
@@ -207,7 +193,7 @@ def assess_hypothesis(hypothesis: dict, client: LLMClient) -> FalsificationResul
         user += f"{i + 1}. [{src}] {text}\n"
 
     raw_text = client.chat([
-        {"role": "system", "content": _OBSERVER_SYSTEM},
+        {"role": "system", "content": system},
         {"role": "user", "content": user},
     ])
     e_product = _extract_e_values_from_text(evidence)
@@ -310,7 +296,9 @@ def assess_hypothesis(hypothesis: dict, client: LLMClient) -> FalsificationResul
     )
 
 
-def assess_terminal_hypotheses(run_dir: str, client: LLMClient | None = None) -> list[FalsificationResult]:
+def assess_terminal_hypotheses(
+    run_dir: str, client: LLMClient | None = None, prompt_variant: str = "original",
+) -> list[FalsificationResult]:
     """Assess all hypotheses with evidence at end of run.
 
     Includes terminal, active, and weakened hypotheses — any hypothesis the
@@ -326,4 +314,4 @@ def assess_terminal_hypotheses(run_dir: str, client: LLMClient | None = None) ->
         h for h in data.get("hypotheses", {}).values()
         if h.get("status") != "refuted" and h.get("evidence")
     ]
-    return [assess_hypothesis(h, c) for h in to_assess]
+    return [assess_hypothesis(h, c, prompt_variant) for h in to_assess]

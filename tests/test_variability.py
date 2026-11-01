@@ -276,3 +276,76 @@ def test_summarize_excludes_observer_parse_failures():
     s = summarize([good, bad])
     assert s["observer"][0]["n"] == 1 and s["observer"][0]["mean"] == pytest.approx(0.9)
     assert s["health"][0]["observer_parse_failures"] == 1
+
+
+# --- prompt variants ---
+
+def test_run_repeats_records_prompt_variant_and_arm(run_dir, tmp_path):
+    out = str(tmp_path / "out.jsonl")
+    seen = []
+
+    def factory(component, backend, temperature):
+        c = _factory()(component, backend, temperature)
+        seen.append(c)
+        return c
+
+    run_repeats([run_dir], repeats=1, out_path=out, client_factory=factory, workers=1,
+                temperature=0.0, prompt_variant="P1")
+    recs = load_records(out)
+    assert {r["arm"] for r in recs} == {"temp0.0-P1"}
+    assert {r["prompt_variant"] for r in recs} == {"P1"}
+    from reviewer.prompt_variants import get_variant
+    judge_prompt = seen[0].calls[0][0]["content"] if seen[0].calls[0][0]["role"] == "user" else ""
+    assert any(get_variant("P1").judge_role in m[0]["content"] for c in seen for m in c.calls
+               if m[0]["role"] == "user")
+
+
+def test_original_variant_keeps_existing_arm_names(run_dir, tmp_path):
+    out = str(tmp_path / "out.jsonl")
+    run_repeats([run_dir], repeats=1, out_path=out, client_factory=_factory(), workers=1)
+    assert {(r["arm"], r["prompt_variant"]) for r in load_records(out)} == {("default", "original")}
+
+
+def test_unknown_prompt_variant_rejected_before_any_call(run_dir, tmp_path):
+    with pytest.raises(ValueError, match="P9"):
+        run_repeats([run_dir], repeats=1, out_path=str(tmp_path / "o.jsonl"),
+                    client_factory=_factory(), workers=1, prompt_variant="P9")
+    assert not (tmp_path / "o.jsonl").exists()
+
+
+# --- compare ---
+
+from reviewer.variability import compare
+
+
+def test_compare_flags_scores_outside_baseline_range():
+    base = [_judge_rec("anthropic", i, {"A": s, "B": 3}, arm="temp0.0") for i, s in enumerate([3, 4, 3])]
+    same = [_judge_rec("anthropic", 0, {"A": 4, "B": 3}, arm="temp0.0-P1")]
+    shifted = [_judge_rec("anthropic", 0, {"A": 5, "B": 1}, arm="temp0.0-P2")]
+    c = compare(base + same + shifted, baseline_arm="temp0.0")
+    rows = {r["arm"]: r for r in c["judge"]}
+    assert rows["temp0.0-P1"]["n_criteria"] == 2 and rows["temp0.0-P1"]["n_outside"] == 0
+    assert rows["temp0.0-P2"]["n_outside"] == 2
+    outside = {(o["hypothesis_id"], o["criterion_id"]): o for o in rows["temp0.0-P2"]["outside"]}
+    assert outside[("A", "novelty")]["baseline_range"] == [3, 4]
+    assert outside[("A", "novelty")]["variant_values"] == [5]
+
+
+def test_compare_observer_against_baseline_range():
+    base = [_obs_rec(i, observer=v) for i, v in enumerate([0.70, 0.74])]
+    for r in base:
+        r["arm"] = "temp0.0"
+    v = _obs_rec(0, observer=0.9)
+    v["arm"] = "temp0.0-P1"
+    rows = compare(base + [v], baseline_arm="temp0.0")["observer"]
+    assert rows[0]["arm"] == "temp0.0-P1" and rows[0]["n_outside"] == 1
+
+
+def test_records_carry_code_version(run_dir, tmp_path):
+    import re
+    out = str(tmp_path / "out.jsonl")
+    run_repeats([run_dir], repeats=1, out_path=out, client_factory=_factory(), workers=1,
+                components=("observer",))
+    rec = load_records(out)[0]
+    assert "code_commit" in rec and "code_dirty" in rec
+    assert rec["code_commit"] is None or re.fullmatch(r"[0-9a-f]{40}", rec["code_commit"])
