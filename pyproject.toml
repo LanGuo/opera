@@ -30,9 +30,10 @@ dev = [
 hypothesis-ledger = "hypothesis_ledger.server:run"
 bioagent-review = "reviewer.review:main"
 bioagent-propose = "task_proposer.wizard:main"
+bioagent-run = "evaluator.run:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["hypothesis_ledger", "reviewer", "task_proposer"]
+packages = ["evaluator", "hypothesis_ledger", "reviewer", "task_proposer"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

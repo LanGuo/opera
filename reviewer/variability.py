@@ -73,7 +73,7 @@ def default_client_factory(component: str, backend: str, temperature: float | No
     )
 
 
-def _code_version() -> dict:
+def code_version() -> dict:
     """Commit of the repo this code runs from, and whether tracked files differ from it."""
     repo = Path(__file__).resolve().parent.parent
 
@@ -183,7 +183,7 @@ def run_repeats(
 
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     lock = threading.Lock()
-    version = _code_version()
+    version = code_version()
 
     def work(unit):
         rec = _run_unit(

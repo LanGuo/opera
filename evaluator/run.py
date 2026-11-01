@@ -1,0 +1,133 @@
+"""Run an agent on a task under a harness profile and record what actually ran.
+
+  python -m evaluator.run claude-sonnet-4-6 --profile matched --max-turns 30
+  python -m evaluator.run gemini-2.5-pro --profile matched --max-turns 30 --gemini-max-session-turns 30
+  python -m evaluator.run claude-sonnet-4-6 --profile matched --dry-run
+
+Load API keys first (e.g. `set -a; source .env; set +a`). See evaluator.harness for the profiles.
+The run directory gets transcript.jsonl, run_manifest.json, and the ledger written by the
+hypothesis-ledger server; reviewer.log_replay runs afterwards unless --skip-log-replay.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+from evaluator.harness import PROFILES, HarnessPlan, finish_run, plan_run, prepare_run, summarize_transcript
+from reviewer.variability import code_version
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def manifest_argv(plan: HarnessPlan, task_text: str) -> list[str]:
+    """The command as run, with the task text (embedded in pilot commands) replaced by a placeholder."""
+    stripped = task_text.rstrip("\n")
+    placeholder = f"<agent_task.md: {len(task_text)} chars>"
+    return [a.replace(stripped, placeholder) if stripped and stripped in a else a for a in plan.argv]
+
+
+def cli_version(cli: str) -> str | None:
+    try:
+        r = subprocess.run([cli, "--version"], capture_output=True, text=True, timeout=60)
+        return (r.stdout or r.stderr).strip().splitlines()[0] if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, IndexError):
+        return None
+
+
+def execute(plan: HarnessPlan, *, task_dir, cli_version: str | None, environ: dict | None = None) -> dict:
+    if (plan.run_dir / "transcript.jsonl").exists():
+        raise FileExistsError(f"run directory already has a transcript: {plan.run_dir}")
+    task_text = (Path(task_dir) / "agent_task.md").read_text(encoding="utf-8")
+    prepare_run(plan)
+    manifest = {
+        "profile": plan.profile,
+        "harness": plan.harness,
+        "cli_version": cli_version,
+        "model_requested": plan.model,
+        **plan.details,
+        "user_message": "Begin the task." if plan.profile == "matched" or plan.harness == "claude" else None,
+        "task_dir": str(task_dir),
+        "task_sha256": hashlib.sha256(task_text.encode("utf-8")).hexdigest(),
+        "cwd": str(plan.cwd),
+        "env_set": plan.env,
+        "argv": manifest_argv(plan, task_text),
+        **code_version(),
+        "started_at": _now(),
+    }
+    path = plan.run_dir / "run_manifest.json"
+    path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    env = {k: v for k, v in (os.environ if environ is None else environ).items() if k not in plan.unset_env}
+    env.update(plan.env)
+    with open(plan.run_dir / "transcript.jsonl", "w", encoding="utf-8") as out, \
+         open(plan.run_dir / "harness_stderr.log", "w", encoding="utf-8") as err:
+        proc = subprocess.run(plan.argv, cwd=plan.cwd, env=env, stdin=subprocess.DEVNULL,
+                              stdout=out, stderr=err)
+    finish_run(plan)
+
+    manifest.update(
+        finished_at=_now(),
+        exit_code=proc.returncode,
+        outcome=summarize_transcript(plan.run_dir / "transcript.jsonl", plan.harness, plan.model),
+    )
+    path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("model")
+    parser.add_argument("--profile", required=True, choices=PROFILES)
+    parser.add_argument("--max-turns", type=int, default=30)
+    parser.add_argument("--gemini-max-session-turns", type=int, default=None,
+                        help="matched Gemini runs only; default: --max-turns")
+    parser.add_argument("--task", default="sle_biomarker_discovery")
+    parser.add_argument("--runs-root", default=os.environ.get("WORKSPACE_ROOT", str(Path.home() / "bioeval")) + "/runs")
+    parser.add_argument("--run-id", default=None)
+    parser.add_argument("--dry-run", action="store_true", help="print the plan and write nothing")
+    parser.add_argument("--skip-log-replay", action="store_true")
+    args = parser.parse_args(argv)
+
+    task_dir = REPO_ROOT / "tasks" / args.task
+    if not (task_dir / "agent_task.md").is_file():
+        sys.exit(f"no agent_task.md in {task_dir}")
+    run_id = args.run_id or f"{args.model}_{args.profile}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    plan = plan_run(
+        profile=args.profile, model=args.model, max_turns=args.max_turns, task_dir=task_dir,
+        run_dir=Path(args.runs_root) / run_id, repo_root=REPO_ROOT, environ=dict(os.environ),
+        gemini_max_session_turns=args.gemini_max_session_turns,
+    )
+    if args.dry_run:
+        task_text = (task_dir / "agent_task.md").read_text(encoding="utf-8")
+        print(json.dumps({
+            "run_dir": str(plan.run_dir), "cwd": str(plan.cwd), "env_set": plan.env,
+            "argv": manifest_argv(plan, task_text), "files": sorted(str(p) for p in plan.files),
+            "copy_before_run": {str(k): str(v) for k, v in plan.copy_before_run.items()},
+            "copy_after_run": {str(k): str(v) for k, v in plan.copy_after_run.items()},
+            **plan.details,
+        }, indent=2))
+        return
+
+    m = execute(plan, task_dir=task_dir, cli_version=cli_version(plan.argv[0]))
+    o = m["outcome"]
+    print(f"run dir: {plan.run_dir}\nexit code: {m['exit_code']}\n"
+          f"segments: {o['segments']}  turns: {o['turns_total']}  tool calls: {o['tool_calls']}  "
+          f"cap hit: {o['cap_hit']}\nmodels used: {o['models_used']}", file=sys.stderr)
+    if o["primary_model_matches_request"] is False:
+        print(f"WARNING: requested {args.model} but most tokens went to {o['primary_model']}", file=sys.stderr)
+    if not args.skip_log_replay:
+        subprocess.run([sys.executable, "-m", "reviewer.log_replay", str(plan.run_dir)])
+
+
+if __name__ == "__main__":
+    main()
