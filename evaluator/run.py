@@ -14,8 +14,10 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -23,6 +25,8 @@ from evaluator.harness import PROFILES, HarnessPlan, finish_run, plan_run, prepa
 from reviewer.variability import code_version
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+RESULT_GRACE_S = 15  # time for the CLI to exit on its own after its result record
+POLL_S = 0.5
 
 
 def _now() -> str:
@@ -44,7 +48,66 @@ def cli_version(cli: str) -> str | None:
         return None
 
 
-def execute(plan: HarnessPlan, *, task_dir, cli_version: str | None, environ: dict | None = None) -> dict:
+def _is_result(line: str) -> bool:
+    if '"result"' not in line:
+        return False
+    try:
+        return json.loads(line).get("type") == "result"
+    except (json.JSONDecodeError, AttributeError):
+        return False
+
+
+def _signal_group(proc: subprocess.Popen, sig: int) -> None:
+    try:
+        os.killpg(proc.pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _stop_group(proc: subprocess.Popen) -> None:
+    """Stop the CLI and everything it started (MCP servers, shell commands)."""
+    _signal_group(proc, signal.SIGTERM)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    _signal_group(proc, signal.SIGKILL)
+
+
+def _run_cli(plan: HarnessPlan, env: dict, out, err, timeout_s: float | None) -> tuple[int, str | None]:
+    """Run the CLI with its output going to `out`. Returns (exit code, why the launcher stopped it).
+
+    The launcher stops it after `timeout_s`, or, when plan.stop_on_result, if it is still running
+    RESULT_GRACE_S after its first result record (the run is over; anything later would extend it).
+    Output goes straight to the file, not through a pipe: Node writes to pipes asynchronously on
+    macOS, and Gemini CLI exits before its final result record is flushed.
+    """
+    proc = subprocess.Popen(plan.argv, cwd=plan.cwd, env=env, stdin=subprocess.DEVNULL,
+                            stdout=out, stderr=err, start_new_session=True)
+    stopped: list[str] = []
+    started = time.monotonic()
+    result_seen_at = None
+    with open(out.name, encoding="utf-8", errors="replace") as watch:
+        pending = ""
+        while proc.poll() is None:
+            time.sleep(POLL_S)
+            pending += watch.read()
+            *lines, pending = pending.split("\n")
+            if plan.stop_on_result and result_seen_at is None and any(_is_result(l) for l in lines):
+                result_seen_at = time.monotonic()
+            if timeout_s and time.monotonic() - started > timeout_s:
+                stopped.append("timeout")
+            elif result_seen_at is not None and time.monotonic() - result_seen_at > RESULT_GRACE_S:
+                stopped.append("after_first_result")
+            if stopped:
+                _stop_group(proc)
+                break
+    _signal_group(proc, signal.SIGKILL)  # leftover MCP servers or shell commands
+    return proc.wait(), (stopped[0] if stopped else None)
+
+
+def execute(plan: HarnessPlan, *, task_dir, cli_version: str | None, environ: dict | None = None,
+            timeout_s: float | None = None) -> dict:
     if (plan.run_dir / "transcript.jsonl").exists():
         raise FileExistsError(f"run directory already has a transcript: {plan.run_dir}")
     task_text = (Path(task_dir) / "agent_task.md").read_text(encoding="utf-8")
@@ -61,6 +124,8 @@ def execute(plan: HarnessPlan, *, task_dir, cli_version: str | None, environ: di
         "cwd": str(plan.cwd),
         "env_set": plan.env,
         "argv": manifest_argv(plan, task_text),
+        "timeout_minutes": timeout_s / 60 if timeout_s else None,
+        "stop_on_result": plan.stop_on_result,
         **code_version(),
         "started_at": _now(),
     }
@@ -71,13 +136,13 @@ def execute(plan: HarnessPlan, *, task_dir, cli_version: str | None, environ: di
     env.update(plan.env)
     with open(plan.run_dir / "transcript.jsonl", "w", encoding="utf-8") as out, \
          open(plan.run_dir / "harness_stderr.log", "w", encoding="utf-8") as err:
-        proc = subprocess.run(plan.argv, cwd=plan.cwd, env=env, stdin=subprocess.DEVNULL,
-                              stdout=out, stderr=err)
+        exit_code, stopped_by = _run_cli(plan, env, out, err, timeout_s)
     finish_run(plan)
 
     manifest.update(
         finished_at=_now(),
-        exit_code=proc.returncode,
+        exit_code=exit_code,
+        stopped_by_launcher=stopped_by,
         outcome=summarize_transcript(plan.run_dir / "transcript.jsonl", plan.harness, plan.model),
     )
     path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -95,6 +160,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--runs-root", default=os.environ.get("WORKSPACE_ROOT", str(Path.home() / "bioeval")) + "/runs")
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--dry-run", action="store_true", help="print the plan and write nothing")
+    parser.add_argument("--timeout-minutes", type=float, default=120,
+                        help="stop the run after this long; 0 for no limit (default: 120)")
     parser.add_argument("--skip-log-replay", action="store_true")
     args = parser.parse_args(argv)
 
@@ -114,12 +181,16 @@ def main(argv: list[str] | None = None) -> None:
             "argv": manifest_argv(plan, task_text), "files": sorted(str(p) for p in plan.files),
             "copy_before_run": {str(k): str(v) for k, v in plan.copy_before_run.items()},
             "copy_after_run": {str(k): str(v) for k, v in plan.copy_after_run.items()},
+            "stop_on_result": plan.stop_on_result, "timeout_minutes": args.timeout_minutes or None,
             **plan.details,
         }, indent=2))
         return
 
-    m = execute(plan, task_dir=task_dir, cli_version=cli_version(plan.argv[0]))
+    m = execute(plan, task_dir=task_dir, cli_version=cli_version(plan.argv[0]),
+                timeout_s=args.timeout_minutes * 60 or None)
     o = m["outcome"]
+    if m["stopped_by_launcher"]:
+        print(f"stopped by the launcher: {m['stopped_by_launcher']}", file=sys.stderr)
     print(f"run dir: {plan.run_dir}\nexit code: {m['exit_code']}\n"
           f"segments: {o['segments']}  turns: {o['turns_total']}  tool calls: {o['tool_calls']}  "
           f"cap hit: {o['cap_hit']}\nmodels used: {o['models_used']}", file=sys.stderr)

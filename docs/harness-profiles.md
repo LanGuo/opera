@@ -16,6 +16,9 @@ launcher (`evaluator/run.py`, also installed as `bioagent-run`) supports two pro
 | Task delivery, Gemini CLI | In the user message (`Instruction: <task> ... Begin the task.`) | **Appended** to the built-in system prompt (a `GEMINI.md` in the workspace) |
 | User message | Claude: `Begin the task.`; Gemini: the task | `Begin the task.` for both |
 | Turn cap | Claude `--max-turns N`; Gemini none | Claude `--max-turns N`; Gemini `model.maxSessionTurns N` |
+| Subagents | On (each CLI's default) | Off: Claude `--disallowedTools Agent Task`; Gemini `tools.exclude ["invoke_agent"]` |
+| Claude background tasks | On | Off (`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`) |
+| Stopping | When the CLI exits, or at `--timeout-minutes` | Also 15 s after the CLI's first result record |
 | Task spec (rubric) | Copied into the run directory before the run | Copied in after the run |
 | Auth | Whatever the user's CLI is configured with | API keys only |
 
@@ -37,6 +40,19 @@ setups from the same command.
   untrusted folders even with `--skip-trust`; the launcher sets `GEMINI_CLI_TRUST_WORKSPACE=true`.
 - **No secrets in run artifacts.** Tool API keys (`NCBI_API_KEY` etc.) are written into the
   configurations as `${VAR}` references, never values.
+- **Subagents off.** Subagents do work the turn cap doesn't count, often on a smaller model. With
+  them off, the cap covers all of the agent's work and the requested model does it. In Gemini CLI
+  0.50, `experimental.enableAgents: false` only disables user-defined agents; the built-in ones
+  stay reachable until the `invoke_agent` tool is excluded.
+  `tools.exclude` is deprecated (Gemini CLI warns it will be removed in 1.0 in favor of its policy
+  engine); recheck this when upgrading the CLI.
+- **Claude Code background tasks off.** In `claude -p`, a background shell command that finishes
+  after the turn cap starts a new invocation in the same session with a fresh turn allowance, and
+  one that never exits keeps the process running. Gemini CLI's turn cap is a hard stop and its
+  background processes don't wake the agent, so they are left on.
+- **The launcher enforces the end of the run.** It stops a matched run that is still running 15 s
+  after its first result record, stops any run at `--timeout-minutes` (default 120), and kills the
+  whole process group, including MCP servers and leftover shell commands.
 
 ## Turn caps mean the same thing in both harnesses
 
@@ -46,20 +62,25 @@ calls. Checked with a cap of 2: Claude Code made 2 responses, then stopped. It r
 CLI made 2 responses (4 parallel tool calls), then stopped with `FatalTurnLimitedError`. The same
 cap therefore gives the same budget.
 
-When comparing runs, measure budget in **main-agent model responses**. Claude Code subagent
-responses are counted separately; the turn cap doesn't limit them.
+When comparing runs, measure budget in **main-agent model responses**. In pilot-profile runs,
+Claude Code subagent responses are counted separately; the turn cap doesn't limit them, and a
+Claude run can exceed the cap through background tasks (more than one session segment).
 
 ## The run manifest
 
 Every run writes `run_manifest.json` next to `transcript.jsonl`:
 
-- **setup:** profile, harness, CLI version, requested model, task delivery, turn cap, isolation,
-  working directory, environment variables set, the command (task text replaced by a placeholder),
-  SHA-256 of `agent_task.md`, code commit, and whether tracked files were modified;
-- **timing:** start and end times, exit code;
-- **outcome:** sessions (more than one means the session was resumed, so the total budget exceeds the
-  cap), turns as reported by the CLI, main-agent and subagent model responses, tool calls, whether
-  the cap was hit, and the models the provider reported with their token counts.
+- **setup:** profile, harness, CLI version, requested model, task delivery, turn cap, subagent and
+  background-task settings, isolation, working directory, environment variables set, the command
+  (task text replaced by a placeholder), SHA-256 of `agent_task.md`, code commit, whether tracked
+  files were modified, and the stopping rules;
+- **timing:** start and end times, exit code, and whether the launcher stopped the run
+  (`stopped_by_launcher`: `after_first_result`, `timeout`, or null);
+- **outcome:** session segments (more than one means the CLI started another invocation, so the
+  total budget exceeds the cap), turns as reported by the CLI, main-agent and subagent model
+  responses, tool calls, whether the cap was hit, and the models the provider reported with their
+  input plus output token counts. (Gemini CLI's per-model `total_tokens` includes cached reads and
+  over-reports them for subagent models.)
 
 Check the models. A CLI can serve a different model than requested (for example, an alias
 resolving to a newer model), and both CLIs use a smaller helper model for some internal work. The
@@ -70,8 +91,9 @@ launcher warns when most tokens did not go to the requested model.
 - **No container isolation.** The agent has shell access to the host and could find repository
   files, including task specs, by searching the filesystem. The clean workspace and configuration
   prevent accidental exposure, not a deliberate search. Use the `Dockerfile` for stronger isolation.
-- **Harnesses still differ by design**: built-in tools, subagents, how MCP tools are loaded, and
-  helper models. These are part of the harness being evaluated.
+- **Harnesses still differ by design**: built-in tools, how MCP tools are loaded, and helper
+  models. These are part of the harness being evaluated. With subagents off, neither CLI runs
+  exactly as shipped.
 - **CLI versions change.** Keep runs that will be compared close together in time; the manifest
   records each run's CLI version.
 
@@ -86,4 +108,4 @@ python -m evaluator.run gemini-2.5-pro   --profile matched --max-turns 30
 
 Options: `--task` (default `sle_biomarker_discovery`), `--runs-root` (default `~/bioeval/runs`, or
 `$WORKSPACE_ROOT/runs`), `--run-id`, `--gemini-max-session-turns` (default: `--max-turns`),
-`--skip-log-replay`. Runs go to `<runs-root>/<model>_<profile>_<timestamp>/`.
+`--timeout-minutes` (default 120; 0 for no limit), `--skip-log-replay`. Runs go to `<runs-root>/<model>_<profile>_<timestamp>/`.

@@ -8,8 +8,10 @@ Two profiles:
   runs under --max-turns; Gemini gets the task as a user message with no turn cap.
 - "matched" runs each CLI as a fresh install would: an empty config home per CLI, a clean
   per-run working directory, only OPERA's two MCP servers, the task appended to each CLI's own
-  system prompt, the same "Begin the task." message, and a turn cap for both. The task spec,
-  which holds the rubric, is copied into the run directory only after the agent finishes.
+  system prompt, the same "Begin the task." message, and a turn cap for both. Subagents are off
+  in both CLIs, and so are Claude Code's background tasks, which can wake the agent after the
+  cap and keep `claude -p` running. The task spec, which holds the rubric, is copied into the
+  run directory only after the agent finishes.
 
 Every run gets a manifest recording what actually ran, including the models the provider
 reported, which can differ from the model requested.
@@ -21,12 +23,17 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from reviewer.log_replay import gemini_response_count
+
 PROFILES = ("pilot", "matched")
 USER_PROMPT = "Begin the task."
 # In scripts/run_eval.sh the "\n" sits inside bash double quotes, so it stays a literal
 # backslash-n; the pilot Gemini prompt contained those characters verbatim.
 PILOT_GEMINI_PROMPT_TEMPLATE = "Instruction: {task}\\n\\nBegin the task."
 TOOLUNIVERSE_KEYS = ("NCBI_API_KEY", "BIOGRID_API_KEY", "DISGENET_API_KEY", "NVIDIA_API_KEY")
+# Claude Code's init record lists the subagent tool as "Task"; the model calls it as "Agent".
+CLAUDE_SUBAGENT_TOOLS = ("Agent", "Task")
+GEMINI_SUBAGENT_TOOL = "invoke_agent"
 
 
 @dataclass
@@ -44,6 +51,8 @@ class HarnessPlan:
     copy_before_run: dict[Path, Path] = field(default_factory=dict)
     copy_after_run: dict[Path, Path] = field(default_factory=dict)
     details: dict = field(default_factory=dict)
+    # Stop the CLI once it writes its first result record, so nothing can extend the run past it.
+    stop_on_result: bool = False
 
 
 def harness_for(model: str) -> str:
@@ -106,22 +115,31 @@ def plan_run(
         argv = ["claude", "-p", USER_PROMPT, "--model", model, "--max-turns", str(max_turns),
                 "--output-format", "stream-json", "--verbose", "--dangerously-skip-permissions",
                 "--strict-mcp-config", "--mcp-config", str(mcp_file),
-                "--append-system-prompt-file", str(task_file)]
+                "--append-system-prompt-file", str(task_file),
+                "--disallowedTools", *CLAUDE_SUBAGENT_TOOLS]
         return HarnessPlan(
             **base, argv=argv, cwd=ws,
-            env={"CLAUDE_CONFIG_DIR": str(home), "EVAL_RUN_DIR": str(run_dir)},
+            env={"CLAUDE_CONFIG_DIR": str(home), "EVAL_RUN_DIR": str(run_dir),
+                 # A background command finishing after the cap starts a new invocation with a
+                 # fresh turn allowance, and one that never exits keeps `claude -p` alive.
+                 "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"},
             files={task_file: task_text, mcp_file: json.dumps({"mcpServers": servers}, indent=2)},
-            dirs=[ws, home], copy_after_run=spec_copy,
+            dirs=[ws, home], copy_after_run=spec_copy, stop_on_result=True,
             details={"task_delivery": "appended to the CLI's built-in system prompt "
                                       "(--append-system-prompt-file)",
                      "turn_cap": f"--max-turns {max_turns}",
+                     "subagents": "off (--disallowedTools " + " ".join(CLAUDE_SUBAGENT_TOOLS) + ")",
+                     "background_tasks": "off (CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1)",
                      "isolation": "empty CLAUDE_CONFIG_DIR, clean workspace, --strict-mcp-config"},
         )
 
     cap = gemini_max_session_turns or max_turns
     home = hdir / "gemini-home"
     servers = _mcp_servers(repo_root, run_dir, environ, trust=True)
-    settings = {"model": {"maxSessionTurns": cap}, "mcpServers": servers}
+    # experimental.enableAgents only gates user-defined agents; the built-in ones stay reachable
+    # through invoke_agent unless the tool itself is excluded.
+    settings = {"model": {"maxSessionTurns": cap}, "tools": {"exclude": [GEMINI_SUBAGENT_TOOL]},
+                "mcpServers": servers}
     argv = ["gemini", "-p", USER_PROMPT, "--model", model, "--output-format", "stream-json",
             "--approval-mode", "yolo", "--skip-trust"]
     return HarnessPlan(
@@ -130,9 +148,12 @@ def plan_run(
              "EVAL_RUN_DIR": str(run_dir)},
         files={ws / "GEMINI.md": task_text,
                ws / ".gemini" / "settings.json": json.dumps(settings, indent=2)},
-        dirs=[ws, home], copy_after_run=spec_copy,
+        dirs=[ws, home], copy_after_run=spec_copy, stop_on_result=True,
         details={"task_delivery": "appended to the CLI's built-in system prompt (workspace GEMINI.md)",
                  "turn_cap": f"model.maxSessionTurns {cap}",
+                 "subagents": f"off (tools.exclude {GEMINI_SUBAGENT_TOOL})",
+                 "background_tasks": "on (background shell processes don't wake the agent; "
+                                     "maxSessionTurns is a hard stop)",
                  "isolation": "empty GEMINI_CLI_HOME, clean workspace, only OPERA's MCP servers"},
     )
 
@@ -207,22 +228,16 @@ def summarize_transcript(path, harness: str, requested_model: str) -> dict:
     else:
         results = [r for r in recs if r.get("type") == "result"]
         tool_calls = sum(1 for r in recs if r.get("type") == "tool_use")
+        # Per-model total_tokens includes cached reads, which Gemini CLI 0.50 over-reports for
+        # subagent models (more cached than input tokens), so count input plus output.
         for r in results:
             for m, s in ((r.get("stats") or {}).get("models") or {}).items():
-                models[m] = models.get(m, 0) + ((s or {}).get("total_tokens") or 0)
+                s = s or {}
+                models[m] = models.get(m, 0) + (s.get("input_tokens") or 0) + (s.get("output_tokens") or 0)
         segments = len(results) or sum(1 for r in recs if r.get("type") == "init")
         turns, turns_total, subagent_responses = [], None, 0
         cap_hit = any(((r.get("error") or {}).get("type") == "FatalTurnLimitedError") for r in results)
-        # Gemini reports no turn count. A response is a run of model output (text and/or parallel
-        # tool calls) ending when tool results come back; maxSessionTurns counts these.
-        responses, awaiting = 0, True
-        for r in recs:
-            t = r.get("type")
-            if t == "tool_use" or (t == "message" and r.get("role") == "assistant"):
-                responses += awaiting
-                awaiting = False
-            elif t == "tool_result":
-                awaiting = True
+        responses = gemini_response_count(recs)
     primary = max(models, key=models.get) if models else None
     return {
         "segments": segments,

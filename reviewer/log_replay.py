@@ -1,7 +1,7 @@
 # eval/log_replay.py
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from hypothesis_ledger.workspace import Workspace
@@ -17,6 +17,12 @@ _LEDGER_TOOLS: frozenset[str] = frozenset({
 })
 _LEDGER_TOOL_COUNT = len(_LEDGER_TOOLS)   # 6 available ops
 _TOOLUNIVERSE_TOOL_COUNT = 600            # approximate; from Gao et al. 2025
+# OPERA's MCP servers. Gemini CLI names their tools 'mcp_<server>_<tool>'; with single underscores
+# the split is ambiguous, so the known server names are matched.
+_MCP_SERVERS = ("hypothesis-ledger", "tooluniverse")
+# ToolUniverse gateway tools: discovery, and execute_tool, which runs the tool named in its
+# 'tool_name' argument. None of them is one of the ~600 biomedical tools.
+_TOOLUNIVERSE_META_TOOLS = frozenset({"execute_tool", "find_tools", "grep_tools", "list_tools", "get_tool_info"})
 
 
 def _normalized_entropy(counts: dict[str, int], n_available: int) -> float | None:
@@ -50,22 +56,51 @@ class RunMetrics:
     revisions_per_hypothesis: float | None     # belief_revision_count / hypothesis_count
     tool_diversity_entropy: float | None       # kept for backward compat (merged, unnormalized)
     tool_diversity_entropy_ledger: float | None    # H / log2(6), ledger ops only
-    tool_diversity_entropy_universe: float | None  # H / log2(600), ToolUniverse only
+    tool_diversity_entropy_universe: float | None  # H / log2(600), over universe_tool_counts
+    # biomedical tool -> calls: execute_tool's target, or a ToolUniverse tool called directly
+    universe_tool_counts: dict = field(default_factory=dict)
+    cost_unpriced_models: list = field(default_factory=list)  # Gemini models left out of cost_usd
 
 
-def _bare_tool_name(name: str) -> str:
-    """Strip 'mcp__<server>__' prefix from MCP tool names.
+def _split_mcp_name(name: str) -> tuple[str | None, str]:
+    """Return (server, bare tool name) for an MCP tool name, or (None, name) for other tools.
 
-    Claude Code transcript uses prefixed names (e.g. 'mcp__hypothesis-ledger__write_hypothesis')
-    while the ledger run_log stores bare names ('write_hypothesis').  Stripping the prefix lets
-    the skip-if-exists merge detect that they refer to the same tool.
+    Claude Code uses 'mcp__<server>__<tool>'; Gemini CLI uses 'mcp_<server>_<tool>' and is only
+    recognized for OPERA's servers.
     """
     if name.startswith("mcp__"):
         rest = name[5:]          # drop 'mcp__'
         sep = rest.find("__")
         if sep >= 0:
-            return rest[sep + 2:]
-    return name
+            return rest[:sep], rest[sep + 2:]
+    elif name.startswith("mcp_"):
+        for server in _MCP_SERVERS:
+            prefix = f"mcp_{server}_"
+            if name.startswith(prefix):
+                return server, name[len(prefix):]
+    return None, name
+
+
+def _bare_tool_name(name: str) -> str:
+    """Strip the MCP server prefix from a tool name.
+
+    Transcripts use prefixed names (e.g. 'mcp__hypothesis-ledger__write_hypothesis' or Gemini's
+    'mcp_hypothesis-ledger_write_hypothesis') while the ledger run_log stores bare names
+    ('write_hypothesis').  Stripping the prefix lets the skip-if-exists merge detect that they
+    refer to the same tool.
+    """
+    return _split_mcp_name(name)[1]
+
+
+def _universe_tool(name: str, args) -> str | None:
+    """The ToolUniverse biomedical tool a call used, or None if it used none."""
+    server, bare = _split_mcp_name(name)
+    if bare == "execute_tool":
+        target = args.get("tool_name") if isinstance(args, dict) else None
+        return target if isinstance(target, str) and target else "unknown"
+    if server == "tooluniverse" and bare not in _TOOLUNIVERSE_META_TOOLS:
+        return bare
+    return None
 
 
 def _confidence_sequence(h: dict) -> list[float]:
@@ -118,23 +153,32 @@ def _directional_flip_count(sequences: list[list[float]], threshold: float = 0.5
 
 _GEMINI_PRICING = {
     # model-substring -> (input $/1M, output $/1M)  — prompts <=200K context window
+    # Standard paid tier, ai.google.dev/gemini-api/docs/pricing, checked 2026-11-01.
     "gemini-2.5-pro": (1.25, 10.0),
-    "gemini-2.5-flash": (0.075, 0.30),
+    "gemini-2.5-flash": (0.30, 2.50),
     "gemini-2.0-flash": (0.10, 0.40),
+    "gemini-3-flash-preview": (0.50, 3.00),
 }
 
 
 def _parse_cost(transcript_path: Path) -> float | None:
-    """Extract run cost from the 'result' events in a transcript.
+    """Extract run cost from the 'result' events in a transcript; see _parse_cost_details."""
+    return _parse_cost_details(transcript_path)[0]
+
+
+def _parse_cost_details(transcript_path: Path) -> tuple[float | None, list[str]]:
+    """Return (run cost, Gemini models with no price) from the 'result' events in a transcript.
 
     Claude transcripts include total_cost_usd. A resumed session writes one result event per
     invocation, each with the session's cumulative cost, so the last value per session is used and
     sessions are summed. Gemini transcripts include token counts per model in stats; cost is
     estimated with _GEMINI_PRICING (first matching model substring wins) from the first result.
-    Returns None if no cost data found.
+    Models without a price are left out of the estimate and listed. Cost is None if no cost data
+    is found.
     """
+    unpriced: list[str] = []
     if not transcript_path.exists():
-        return None
+        return None, unpriced
     claude_costs: dict = {}
     gemini_cost: float | None = None
     for line in transcript_path.read_text(encoding="utf-8").strip().splitlines():
@@ -159,14 +203,32 @@ def _parse_cost(transcript_path: Path) -> float | None:
                     (v for k, v in _GEMINI_PRICING.items() if k in model_name), None
                 )
                 if price is None:
+                    unpriced.append(model_name)
                     continue
                 inp = model_stats.get("input", 0) or 0       # non-cached input tokens
                 out = model_stats.get("output_tokens", 0) or 0
                 total += inp / 1e6 * price[0] + out / 1e6 * price[1]
             gemini_cost = total if total > 0 else None
     if claude_costs:
-        return sum(claude_costs.values())
-    return gemini_cost
+        return sum(claude_costs.values()), unpriced
+    return gemini_cost, unpriced
+
+
+def gemini_response_count(events: list[dict]) -> int:
+    """Count model responses in a Gemini CLI stream-json transcript.
+
+    Gemini reports no turn count. A response is a run of model output (text and/or parallel tool
+    calls) ending when tool results come back; model.maxSessionTurns counts these.
+    """
+    responses, awaiting = 0, True
+    for event in events:
+        t = event.get("type")
+        if t == "tool_use" or (t == "message" and event.get("role") == "assistant"):
+            responses += awaiting
+            awaiting = False
+        elif t == "tool_result":
+            awaiting = True
+    return responses
 
 
 def _parse_turn_count(transcript_path: Path) -> int | None:
@@ -177,13 +239,13 @@ def _parse_turn_count(transcript_path: Path) -> int | None:
        harness at the end of each invocation. A resumed session writes one result event per
        invocation, each counting only that invocation's turns, so they are summed.
     2. Claude Code streaming: count ``message_start`` events (one per API call).
-    3. Gemini CLI: count ``response`` events (one per turn).
+    3. Gemini CLI: count model responses (gemini_response_count).
     Returns None if the transcript does not exist or no turn signal is found.
     """
     if not transcript_path.exists():
         return None
     message_starts = 0
-    gemini_responses = 0
+    events: list[dict] = []
     result_turns: list[int] = []
     for line in transcript_path.read_text(encoding="utf-8").strip().splitlines():
         if not line:
@@ -192,30 +254,34 @@ def _parse_turn_count(transcript_path: Path) -> int | None:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
+        events.append(event)
         t = event.get("type")
         if t == "result" and "num_turns" in event:
             result_turns.append(int(event["num_turns"]))
         elif t == "message_start":
             message_starts += 1
-        elif t == "response":
-            gemini_responses += 1
     if result_turns:
         return sum(result_turns)
-    count = message_starts or gemini_responses
+    count = message_starts or gemini_response_count(events)
     return count if count > 0 else None
 
 
-def _parse_transcript(transcript_path: Path) -> dict[str, int]:
-    """Extract tool call counts from harness transcripts.
+def _tool_calls(transcript_path: Path) -> list[tuple[str, dict]]:
+    """Extract (tool name, arguments) for each tool call in a harness transcript.
 
     Supports:
     - Claude Code: {"type": "content_block_start", "content_block": {"type": "tool_use", "name": ...}}
     - Claude Code (-p): {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": ...}]}}
-    - Gemini CLI: {"type": "tool_use", "tool_name": ..., "tool_id": ...}
+    - Gemini CLI: {"type": "tool_use", "tool_name": ..., "tool_id": ..., "parameters": ...}
+
+    Gemini calls to a tool name that doesn't exist (error type 'tool_not_registered') never ran
+    and are left out.
     """
-    counts: dict[str, int] = {}
+    calls: list[tuple[str, dict]] = []
     if not transcript_path.exists():
-        return counts
+        return calls
+    gemini_ids: list = []
+    unregistered: set = set()
     for line in transcript_path.read_text(encoding="utf-8").strip().splitlines():
         if not line:
             continue
@@ -226,22 +292,43 @@ def _parse_transcript(transcript_path: Path) -> dict[str, int]:
 
         # Gemini CLI format
         if event.get("type") == "tool_use" and "tool_name" in event:
-            name = event["tool_name"]
-            counts[name] = counts.get(name, 0) + 1
+            calls.append((event["tool_name"], event.get("parameters") or {}))
+            gemini_ids.append(event.get("tool_id"))
+            continue
+        if event.get("type") == "tool_result" and (event.get("error") or {}).get("type") == "tool_not_registered":
+            unregistered.add(event.get("tool_id"))
             continue
 
         # Claude Code Streaming format
         if event.get("type") == "content_block_start":
             block = event.get("content_block", {})
             if block.get("type") == "tool_use":
-                name = block.get("name", "unknown")
-                counts[name] = counts.get(name, 0) + 1
+                calls.append((block.get("name", "unknown"), block.get("input") or {}))
+                gemini_ids.append(None)
         # Claude Code Non-streaming / -p format
         elif event.get("type") == "assistant":
             for block in event.get("message", {}).get("content", []):
                 if block.get("type") == "tool_use":
-                    name = block.get("name", "unknown")
-                    counts[name] = counts.get(name, 0) + 1
+                    calls.append((block.get("name", "unknown"), block.get("input") or {}))
+                    gemini_ids.append(None)
+    return [c for c, tid in zip(calls, gemini_ids) if tid is None or tid not in unregistered]
+
+
+def _parse_transcript(transcript_path: Path) -> dict[str, int]:
+    """Count tool calls by tool name in a harness transcript (see _tool_calls)."""
+    counts: dict[str, int] = {}
+    for name, _ in _tool_calls(transcript_path):
+        counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _parse_universe_calls(transcript_path: Path) -> dict[str, int]:
+    """Count calls per ToolUniverse biomedical tool, resolving execute_tool to its target."""
+    counts: dict[str, int] = {}
+    for name, args in _tool_calls(transcript_path):
+        tool = _universe_tool(name, args)
+        if tool is not None:
+            counts[tool] = counts.get(tool, 0) + 1
     return counts
 
 
@@ -295,9 +382,11 @@ def analyze_run(run_dir: str) -> RunMetrics:
         belief_revision_count / n_hypotheses if n_hypotheses > 0 else None
     )
 
-    # Split tool_diversity by server for separate entropy computation.
+    # Entropy per tool layer: the ledger's six operations, and the ToolUniverse biomedical tools
+    # actually run (built-in harness tools and ToolUniverse discovery calls are in neither).
     ledger_counts = {k: v for k, v in tool_diversity.items() if k in _LEDGER_TOOLS}
-    universe_counts = {k: v for k, v in tool_diversity.items() if k not in _LEDGER_TOOLS}
+    universe_counts = _parse_universe_calls(transcript_path)
+    cost_usd, unpriced = _parse_cost_details(transcript_path)
 
     # Merged unnormalized entropy (kept for backward compat).
     total_calls = sum(tool_diversity.values())
@@ -321,12 +410,14 @@ def analyze_run(run_dir: str) -> RunMetrics:
         martingale_score=martingale_score_val,
         martingale_n=martingale_n,
         directional_flip_count=flip_count,
-        cost_usd=_parse_cost(transcript_path),
+        cost_usd=cost_usd,
         turn_count=_parse_turn_count(transcript_path),
         revisions_per_hypothesis=revisions_per_hypothesis,
         tool_diversity_entropy=tool_diversity_entropy,
         tool_diversity_entropy_ledger=_normalized_entropy(ledger_counts, _LEDGER_TOOL_COUNT),
         tool_diversity_entropy_universe=_normalized_entropy(universe_counts, _TOOLUNIVERSE_TOOL_COUNT),
+        universe_tool_counts=universe_counts,
+        cost_unpriced_models=unpriced,
     )
 
 
@@ -346,6 +437,8 @@ def print_report(metrics: RunMetrics) -> None:
     tc = metrics.turn_count
     print(f"Turns used:            {tc if tc is not None else 'N/A'}")
     cost_str = f"${metrics.cost_usd:.4f}" if metrics.cost_usd is not None else "N/A"
+    if metrics.cost_unpriced_models:
+        cost_str += f"  (excludes unpriced: {', '.join(metrics.cost_unpriced_models)})"
     print(f"Estimated cost:        {cost_str}")
 
     def _fmt_entropy(e: float | None) -> str:
@@ -356,7 +449,10 @@ def print_report(metrics: RunMetrics) -> None:
     print("\nModality coverage per hypothesis:")
     for h_id, sources in metrics.modality_coverage.items():
         print(f"  {h_id}: {sorted(sources)}")
-    print("\nTool usage (all MCP servers):")
+    print("\nToolUniverse tools run:")
+    for tool, count in sorted(metrics.universe_tool_counts.items(), key=lambda x: -x[1]):
+        print(f"  {tool}: {count}")
+    print("\nTool usage (all tools):")
     for tool, count in sorted(metrics.tool_diversity.items(), key=lambda x: -x[1]):
         print(f"  {tool}: {count}")
 

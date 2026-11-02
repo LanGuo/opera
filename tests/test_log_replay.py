@@ -281,3 +281,88 @@ def test_cost_summed_across_different_sessions(tmp_path):
                                {"session": "s2", "turns": 5, "cost": 0.5}])
     assert _parse_turn_count(p) == 15
     assert _parse_cost(p) == pytest.approx(1.5)
+
+
+# --- Gemini tool names, ToolUniverse layer, Gemini turns and prices ---
+
+from reviewer.log_replay import _parse_cost_details, _parse_universe_calls
+
+
+def _write_events(tmp_path, events):
+    p = tmp_path / "transcript.jsonl"
+    p.write_text("\n".join(_json.dumps(e) for e in events) + "\n")
+    return p
+
+
+def test_bare_tool_name_strips_gemini_prefix_for_opera_servers():
+    assert _bare_tool_name("mcp_hypothesis-ledger_write_hypothesis") == "write_hypothesis"
+    assert _bare_tool_name("mcp_tooluniverse_execute_tool") == "execute_tool"
+    assert _bare_tool_name("mcp_exa_web_search_exa") == "mcp_exa_web_search_exa"  # unknown server
+
+
+def test_gemini_calls_to_unregistered_tools_are_not_counted(tmp_path):
+    p = _write_events(tmp_path, [
+        {"type": "tool_use", "tool_name": "mcp_hypothesis_ledger_write_hypothesis", "tool_id": "t1"},
+        {"type": "tool_result", "tool_id": "t1", "status": "error",
+         "error": {"type": "tool_not_registered", "message": "not found"}},
+        {"type": "tool_use", "tool_name": "mcp_hypothesis-ledger_write_hypothesis", "tool_id": "t2"},
+        {"type": "tool_result", "tool_id": "t2", "status": "success"},
+        {"type": "tool_use", "tool_name": "run_shell_command", "tool_id": "t3"},
+        {"type": "tool_result", "tool_id": "t3", "status": "error", "error": {"type": "shell_error"}},
+    ])
+    assert _parse_transcript(p) == {"mcp_hypothesis-ledger_write_hypothesis": 1, "run_shell_command": 1}
+
+
+def test_gemini_ledger_calls_merge_with_run_log(tmp_path):
+    ws = Workspace(str(tmp_path / "run"))
+    ws.log_run({"tool": "write_hypothesis", "result": {}})
+    _write_events(tmp_path / "run", [
+        {"type": "tool_use", "tool_name": "mcp_hypothesis-ledger_write_hypothesis", "tool_id": "t1"},
+    ])
+    m = analyze_run(str(tmp_path / "run"))
+    assert m.tool_diversity == {"write_hypothesis": 1}
+
+
+def test_universe_layer_counts_biomedical_tools_only(tmp_path):
+    p = _write_events(tmp_path, [
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "mcp__tooluniverse__find_tools", "input": {"query": "x"}},
+            {"type": "tool_use", "name": "mcp__tooluniverse__execute_tool",
+             "input": {"tool_name": "PubMed_search_articles", "arguments": {}}},
+            {"type": "tool_use", "name": "mcp__tooluniverse__execute_tool",
+             "input": {"tool_name": "PubMed_search_articles", "arguments": {}}},
+            {"type": "tool_use", "name": "mcp__tooluniverse__BiomarkerDiscoveryWorkflow", "input": {}},
+            {"type": "tool_use", "name": "Bash", "input": {"command": "ls"}},
+            {"type": "tool_use", "name": "WebSearch", "input": {"query": "y"}},
+            {"type": "tool_use", "name": "mcp__hypothesis-ledger__write_hypothesis", "input": {}},
+        ]}},
+        {"type": "tool_use", "tool_name": "mcp_tooluniverse_execute_tool", "tool_id": "g1",
+         "parameters": {"tool_name": "DisGeNET_get_gda", "arguments": {}}},
+    ])
+    assert _parse_universe_calls(p) == {
+        "PubMed_search_articles": 2, "BiomarkerDiscoveryWorkflow": 1, "DisGeNET_get_gda": 1,
+    }
+
+
+def test_gemini_turns_counted_from_responses(tmp_path):
+    p = _write_events(tmp_path, [
+        {"type": "init"},
+        {"type": "message", "role": "user", "content": "Begin the task."},
+        {"type": "tool_use", "tool_name": "a", "tool_id": "1"},
+        {"type": "tool_use", "tool_name": "b", "tool_id": "2"},   # same response, parallel calls
+        {"type": "tool_result", "tool_id": "1"}, {"type": "tool_result", "tool_id": "2"},
+        {"type": "message", "role": "assistant", "content": "done"},
+        {"type": "result", "stats": {}},
+    ])
+    assert _parse_turn_count(p) == 2
+
+
+def test_gemini_cost_prices_known_models_and_lists_unpriced(tmp_path):
+    p = _write_events(tmp_path, [{"type": "result", "stats": {"models": {
+        "gemini-2.5-pro": {"input": 1_000_000, "output_tokens": 100_000},
+        "gemini-3-flash-preview": {"input": 1_000_000, "output_tokens": 1_000_000},
+        "gemini-9-mystery": {"input": 5, "output_tokens": 5},
+    }}}])
+    cost, unpriced = _parse_cost_details(p)
+    assert cost == pytest.approx(1.25 + 1.0 + 0.5 + 3.0)
+    assert unpriced == ["gemini-9-mystery"]

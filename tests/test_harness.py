@@ -282,3 +282,106 @@ def test_summarize_claude_usage_is_cumulative_within_a_session(tmp_path):
     _write(t, [res("s1", 100), res("s1", 250), res("s2", 40)])
     s = summarize_transcript(t, "claude", requested_model="m")
     assert s["models_used"] == {"m": 290}
+
+
+# --- subagents, background tasks, and stopping runs ---
+
+def test_matched_claude_turns_off_subagents_and_background_tasks(setup):
+    p = _plan(setup, "matched", "claude-sonnet-4-6")
+    i = p.argv.index("--disallowedTools")
+    assert p.argv[i + 1:i + 3] == ["Agent", "Task"]
+    assert p.env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] == "1"
+    assert p.stop_on_result is True
+    assert p.details["subagents"].startswith("off")
+
+
+def test_matched_gemini_excludes_subagent_tool(setup):
+    _, _, run_dir = setup
+    p = _plan(setup, "matched", "gemini-2.5-pro")
+    settings = json.loads(p.files[run_dir / "workspace" / ".gemini" / "settings.json"])
+    assert settings["tools"]["exclude"] == ["invoke_agent"]
+    assert p.stop_on_result is True
+
+
+@pytest.mark.parametrize("model", ["claude-sonnet-4-6", "gemini-2.5-pro"])
+def test_pilot_keeps_cli_defaults(setup, model):
+    p = _plan(setup, "pilot", model)
+    assert "--disallowedTools" not in p.argv
+    assert "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" not in p.env
+    assert p.stop_on_result is False
+
+
+def _fake_plan(setup, script):
+    repo, task_dir, run_dir = setup
+    plan = plan_run(profile="matched", model="claude-sonnet-4-6", max_turns=30, task_dir=task_dir,
+                    run_dir=run_dir, repo_root=repo, environ={})
+    plan.argv = [sys.executable, "-c", script]
+    return plan, task_dir, run_dir
+
+
+_RESULT = 'print(json.dumps({"type": "result", "subtype": "success", "num_turns": 3}), flush=True)\n'
+
+
+def test_execute_records_natural_exit(setup):
+    plan, task_dir, _ = _fake_plan(setup, "import json\n" + _RESULT)
+    m = execute(plan, task_dir=task_dir, cli_version=None, environ={"PATH": "/usr/bin"}, timeout_s=30)
+    assert m["stopped_by_launcher"] is None and m["exit_code"] == 0
+    assert m["timeout_minutes"] == 0.5 and m["stop_on_result"] is True
+
+
+def test_execute_stops_cli_that_keeps_running_after_its_result(setup, monkeypatch):
+    import time
+    import evaluator.run as run_mod
+    monkeypatch.setattr(run_mod, "RESULT_GRACE_S", 0.3)
+    script = ("import json, time\n" + _RESULT +
+              "time.sleep(30)\nprint(json.dumps({'type': 'result', 'subtype': 'late'}))\n")
+    plan, task_dir, run_dir = _fake_plan(setup, script)
+    t0 = time.monotonic()
+    m = execute(plan, task_dir=task_dir, cli_version=None, environ={"PATH": "/usr/bin"}, timeout_s=60)
+    assert time.monotonic() - t0 < 15
+    assert m["stopped_by_launcher"] == "after_first_result"
+    assert "late" not in (run_dir / "transcript.jsonl").read_text()
+    assert m["outcome"]["segments"] == 1
+
+
+def test_execute_timeout_stops_cli(setup):
+    import time
+    plan, task_dir, _ = _fake_plan(setup, "import time\ntime.sleep(60)\n")
+    t0 = time.monotonic()
+    m = execute(plan, task_dir=task_dir, cli_version=None, environ={"PATH": "/usr/bin"}, timeout_s=1)
+    assert time.monotonic() - t0 < 15
+    assert m["stopped_by_launcher"] == "timeout"
+
+
+def test_execute_kills_processes_the_cli_leaves_behind(setup):
+    import os
+    import time
+    # The CLI exits but leaves a child running, like a stuck background shell.
+    script = ("import subprocess, sys, os\n"
+              "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+              "print(c.pid, flush=True)\n")
+    plan, task_dir, run_dir = _fake_plan(setup, script)
+    t0 = time.monotonic()
+    m = execute(plan, task_dir=task_dir, cli_version=None, environ={"PATH": "/usr/bin"}, timeout_s=60)
+    assert time.monotonic() - t0 < 15
+    assert m["stopped_by_launcher"] is None
+    child = int((run_dir / "transcript.jsonl").read_text().split()[0])
+    for _ in range(50):
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.1)
+    else:
+        pytest.fail("leftover child still running")
+
+
+def test_execute_keeps_output_written_just_before_exit(setup):
+    # Gemini CLI writes its result record and exits at once; it must reach the transcript.
+    script = ("import os\n"
+              "os.write(1, b'x' * 200000 + b'\\n{\"type\": \"result\", \"subtype\": \"end\"}\\n')\n"
+              "os._exit(53)\n")
+    plan, task_dir, run_dir = _fake_plan(setup, script)
+    m = execute(plan, task_dir=task_dir, cli_version=None, environ={"PATH": "/usr/bin"}, timeout_s=60)
+    assert m["exit_code"] == 53
+    assert (run_dir / "transcript.jsonl").read_text().splitlines()[-1] == '{"type": "result", "subtype": "end"}'
