@@ -133,9 +133,11 @@ def test_pilot_copies_rubric_before_run(setup):
 def test_prepare_run_writes_files_and_dirs(setup):
     _, _, run_dir = setup
     p = _plan(setup, "matched", "gemini-2.5-pro")
+    p.venv = None  # venv creation is tested on its own
     prepare_run(p)
     assert (run_dir / "workspace" / "GEMINI.md").is_file()
     assert (run_dir / "harness" / "gemini-home").is_dir()
+    assert (run_dir / "harness" / "tmp").is_dir()
     assert not (run_dir / "task_spec.yaml").exists()
 
 
@@ -193,6 +195,7 @@ def test_execute_runs_records_manifest_and_copies_rubric_after(setup):
     repo, task_dir, run_dir = setup
     plan = plan_run(profile="matched", model="claude-sonnet-4-6", max_turns=30, task_dir=task_dir,
                     run_dir=run_dir, repo_root=repo, environ={})
+    plan.venv, plan.sweep_tmp = None, False
     fake = ('import json, os, pathlib\n'
             'seen = pathlib.Path(os.environ["EVAL_RUN_DIR"], "task_spec.yaml").exists()\n'
             'print(json.dumps({"type": "system", "subtype": "init", "cwd": os.getcwd(), "rubric_visible": seen}))\n'
@@ -316,6 +319,7 @@ def _fake_plan(setup, script):
     plan = plan_run(profile="matched", model="claude-sonnet-4-6", max_turns=30, task_dir=task_dir,
                     run_dir=run_dir, repo_root=repo, environ={})
     plan.argv = [sys.executable, "-c", script]
+    plan.venv, plan.sweep_tmp = None, False  # tested on their own below
     return plan, task_dir, run_dir
 
 
@@ -385,3 +389,74 @@ def test_execute_keeps_output_written_just_before_exit(setup):
     m = execute(plan, task_dir=task_dir, cli_version=None, environ={"PATH": "/usr/bin"}, timeout_s=60)
     assert m["exit_code"] == 53
     assert (run_dir / "transcript.jsonl").read_text().splitlines()[-1] == '{"type": "result", "subtype": "end"}'
+
+
+# --- per-run Python environment and temp files ---
+
+@pytest.mark.parametrize("model", ["claude-sonnet-4-6", "gemini-2.5-pro"])
+def test_matched_runs_get_own_python_and_tmpdir(setup, model):
+    _, _, run_dir = setup
+    p = _plan(setup, "matched", model, environ={"PATH": "/usr/bin:/bin"})
+    venv = run_dir / "harness" / "venv"
+    assert p.venv == venv and p.sweep_tmp is True
+    assert p.env["PATH"] == f"{venv / 'bin'}:/usr/bin:/bin"
+    assert p.env["VIRTUAL_ENV"] == str(venv)
+    assert p.env["PYTHONNOUSERSITE"] == "1"
+    assert p.env["TMPDIR"] == str(run_dir / "harness" / "tmp")
+    if model.startswith("claude"):
+        assert p.env["CLAUDE_CODE_TMPDIR"] == str(run_dir / "harness" / "tmp")
+
+
+def test_pilot_runs_keep_user_python(setup):
+    p = _plan(setup, "pilot", "claude-sonnet-4-6", environ={"PATH": "/usr/bin"})
+    assert p.venv is None and p.sweep_tmp is False and "PATH" not in p.env
+
+
+def test_prepare_run_creates_venv_with_run_python(setup):
+    import shutil as _sh
+    if not _sh.which("uv"):
+        pytest.skip("uv not installed")
+    from evaluator.harness import RUN_PYTHON
+    _, _, run_dir = setup
+    p = _plan(setup, "matched", "claude-sonnet-4-6")
+    try:
+        prepare_run(p)
+    except Exception as e:  # e.g. no Python RUN_PYTHON available offline
+        pytest.skip(f"uv venv failed: {e}")
+    cfg = (run_dir / "harness" / "venv" / "pyvenv.cfg").read_text()
+    assert f"version_info = {RUN_PYTHON}." in cfg or f"version = {RUN_PYTHON}." in cfg
+    assert (run_dir / "harness" / "venv" / "bin" / "pip").exists()
+
+
+def test_sweep_tmp_moves_only_new_entries_the_agent_named(tmp_path):
+    from evaluator.run import sweep_tmp
+    tmp = tmp_path / "shared"
+    tmp.mkdir()
+    (tmp / "old.py").write_text("before the run")
+    before = {"old.py"}
+    for name in ("sle_x.py", "sle_x.py.bak", "other_app.sock"):
+        (tmp / name).write_text("new")
+    (tmp / "scratch").mkdir()
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"command": "python3 /tmp/sle_x.py; ls /private/tmp/scratch/ ; cat /tmp/old.py"}\n')
+    out = sweep_tmp(tmp, before, transcript, tmp_path / "leftovers")
+    assert out["moved"] == ["scratch", "sle_x.py"]
+    assert out["unattributed"] == ["other_app.sock", "sle_x.py.bak"]
+    assert (tmp_path / "leftovers" / "sle_x.py").is_file() and (tmp / "old.py").exists()
+    assert not (tmp / "sle_x.py").exists() and (tmp / "other_app.sock").exists()
+
+
+def test_summarize_counts_tool_errors_by_cause(tmp_path):
+    path = tmp_path / "t.jsonl"
+    _write(path, [
+        {"type": "tool_use", "tool_name": "mcp_tooluniverse_find_tools", "tool_id": "1"},
+        {"type": "tool_result", "tool_id": "1", "status": "error", "error": {
+            "type": "mcp_tool_error", "message": "wait_for_previous  Unexpected keyword argument"}},
+        {"type": "tool_use", "tool_name": "mcp_hypothesis_ledger_x", "tool_id": "2"},
+        {"type": "tool_result", "tool_id": "2", "status": "error",
+         "error": {"type": "tool_not_registered", "message": "not found"}},
+        {"type": "tool_use", "tool_name": "read_file", "tool_id": "3"},
+        {"type": "tool_result", "tool_id": "3", "status": "success"},
+    ])
+    s = summarize_transcript(path, "gemini", "gemini-2.5-pro")
+    assert s["tool_errors"] == {"wait_for_previous_rejected": 1, "tool_not_registered": 1}

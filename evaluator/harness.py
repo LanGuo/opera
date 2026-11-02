@@ -10,8 +10,9 @@ Two profiles:
   per-run working directory, only OPERA's two MCP servers, the task appended to each CLI's own
   system prompt, the same "Begin the task." message, and a turn cap for both. Subagents are off
   in both CLIs, and so are Claude Code's background tasks, which can wake the agent after the
-  cap and keep `claude -p` running. The task spec, which holds the rubric, is copied into the
-  run directory only after the agent finishes.
+  cap and keep `claude -p` running. Each run gets its own Python environment and temp directory,
+  so packages and files one agent leaves behind don't reach the next. The task spec, which holds
+  the rubric, is copied into the run directory only after the agent finishes.
 
 Every run gets a manifest recording what actually ran, including the models the provider
 reported, which can differ from the model requested.
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -34,6 +36,8 @@ TOOLUNIVERSE_KEYS = ("NCBI_API_KEY", "BIOGRID_API_KEY", "DISGENET_API_KEY", "NVI
 # Claude Code's init record lists the subagent tool as "Task"; the model calls it as "Agent".
 CLAUDE_SUBAGENT_TOOLS = ("Agent", "Task")
 GEMINI_SUBAGENT_TOOL = "invoke_agent"
+# Python for each run's own environment. cellxgene-census's tiledbsoma doesn't build on 3.14.
+RUN_PYTHON = "3.12"
 
 
 @dataclass
@@ -53,6 +57,8 @@ class HarnessPlan:
     details: dict = field(default_factory=dict)
     # Stop the CLI once it writes its first result record, so nothing can extend the run past it.
     stop_on_result: bool = False
+    venv: Path | None = None   # created with RUN_PYTHON before the run; first on the agent's PATH
+    sweep_tmp: bool = False    # move files the agent left in the shared /tmp into the run dir
 
 
 def harness_for(model: str) -> str:
@@ -109,6 +115,15 @@ def plan_run(
         )
 
     ws, hdir = run_dir / "workspace", run_dir / "harness"
+    venv, tmp = hdir / "venv", hdir / "tmp"
+    path = environ.get("PATH", "")
+    # Agents install packages and write scratch files. A per-run environment, with the user's
+    # site-packages hidden, and a per-run TMPDIR keep one run's leftovers from reaching the next.
+    run_env = {"PATH": f"{venv / 'bin'}:{path}" if path else str(venv / "bin"),
+               "VIRTUAL_ENV": str(venv), "PYTHONNOUSERSITE": "1", "TMPDIR": str(tmp)}
+    isolation = dict(venv=venv, sweep_tmp=True)
+    env_details = {"python_env": f"fresh venv (Python {RUN_PYTHON}) first on PATH, user site hidden",
+                   "tmpdir": "per-run TMPDIR; new /tmp entries the agent named are moved into the run dir"}
     if harness == "claude":
         home, task_file, mcp_file = hdir / "claude-home", hdir / "agent_task.md", hdir / "mcp.json"
         servers = _mcp_servers(repo_root, run_dir, environ, trust=False)
@@ -122,14 +137,18 @@ def plan_run(
             env={"CLAUDE_CONFIG_DIR": str(home), "EVAL_RUN_DIR": str(run_dir),
                  # A background command finishing after the cap starts a new invocation with a
                  # fresh turn allowance, and one that never exits keeps `claude -p` alive.
-                 "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"},
+                 "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1", **run_env,
+                 # Claude Code gives its shell TMPDIR=<this>/claude-<uid> (default base /tmp,
+                 # shared by every Claude Code session on the machine).
+                 "CLAUDE_CODE_TMPDIR": str(tmp)},
             files={task_file: task_text, mcp_file: json.dumps({"mcpServers": servers}, indent=2)},
-            dirs=[ws, home], copy_after_run=spec_copy, stop_on_result=True,
+            dirs=[ws, home, tmp], copy_after_run=spec_copy, stop_on_result=True, **isolation,
             details={"task_delivery": "appended to the CLI's built-in system prompt "
                                       "(--append-system-prompt-file)",
                      "turn_cap": f"--max-turns {max_turns}",
                      "subagents": "off (--disallowedTools " + " ".join(CLAUDE_SUBAGENT_TOOLS) + ")",
                      "background_tasks": "off (CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1)",
+                     **env_details,
                      "isolation": "empty CLAUDE_CONFIG_DIR, clean workspace, --strict-mcp-config"},
         )
 
@@ -145,15 +164,16 @@ def plan_run(
     return HarnessPlan(
         **base, argv=argv, cwd=ws,
         env={"GEMINI_CLI_HOME": str(home), "GEMINI_CLI_TRUST_WORKSPACE": "true",
-             "EVAL_RUN_DIR": str(run_dir)},
+             "EVAL_RUN_DIR": str(run_dir), **run_env},
         files={ws / "GEMINI.md": task_text,
                ws / ".gemini" / "settings.json": json.dumps(settings, indent=2)},
-        dirs=[ws, home], copy_after_run=spec_copy, stop_on_result=True,
+        dirs=[ws, home, tmp], copy_after_run=spec_copy, stop_on_result=True, **isolation,
         details={"task_delivery": "appended to the CLI's built-in system prompt (workspace GEMINI.md)",
                  "turn_cap": f"model.maxSessionTurns {cap}",
                  "subagents": f"off (tools.exclude {GEMINI_SUBAGENT_TOOL})",
                  "background_tasks": "on (background shell processes don't wake the agent; "
                                      "maxSessionTurns is a hard stop)",
+                 **env_details,
                  "isolation": "empty GEMINI_CLI_HOME, clean workspace, only OPERA's MCP servers"},
     )
 
@@ -167,6 +187,9 @@ def prepare_run(plan: HarnessPlan) -> None:
         path.write_text(content, encoding="utf-8")
     for src, dst in plan.copy_before_run.items():
         shutil.copy2(src, dst)
+    if plan.venv is not None:
+        subprocess.run(["uv", "venv", "--quiet", "--seed", "--python", RUN_PYTHON, str(plan.venv)],
+                       check=True, stdin=subprocess.DEVNULL)
 
 
 def finish_run(plan: HarnessPlan) -> None:
@@ -225,6 +248,11 @@ def summarize_transcript(path, harness: str, requested_model: str) -> dict:
             if mid:
                 ids[bool(r.get("parent_tool_use_id"))].add(mid)
         responses, subagent_responses = len(ids[False]), len(ids[True])
+        tool_errors = {"error": sum(
+            1 for r in recs if r.get("type") == "user"
+            for c in (r.get("message") or {}).get("content", []) or []
+            if isinstance(c, dict) and c.get("type") == "tool_result" and c.get("is_error")
+        )}
     else:
         results = [r for r in recs if r.get("type") == "result"]
         tool_calls = sum(1 for r in recs if r.get("type") == "tool_use")
@@ -238,6 +266,16 @@ def summarize_transcript(path, harness: str, requested_model: str) -> dict:
         turns, turns_total, subagent_responses = [], None, 0
         cap_hit = any(((r.get("error") or {}).get("type") == "FatalTurnLimitedError") for r in results)
         responses = gemini_response_count(recs)
+        # Failed calls by cause. Gemini CLI adds a wait_for_previous parameter to every tool schema,
+        # MCP tools included, and passes it on; MCP servers that validate arguments reject it.
+        tool_errors = {}
+        for r in recs:
+            err = r.get("error") if r.get("type") == "tool_result" else None
+            if err:
+                cause = err.get("type") or "unknown"
+                if "wait_for_previous" in (err.get("message") or ""):
+                    cause = "wait_for_previous_rejected"
+                tool_errors[cause] = tool_errors.get(cause, 0) + 1
     primary = max(models, key=models.get) if models else None
     return {
         "segments": segments,
@@ -247,6 +285,7 @@ def summarize_transcript(path, harness: str, requested_model: str) -> dict:
         "model_responses": responses,
         "subagent_responses": subagent_responses,
         "tool_calls": tool_calls,
+        "tool_errors": {k: v for k, v in tool_errors.items() if v},
         "models_used": models,
         "primary_model": primary,
         "primary_model_matches_request": None if primary is None else primary.startswith(requested_model),
