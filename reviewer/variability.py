@@ -113,6 +113,7 @@ def _judge_result(scores) -> dict:
             for hs in scores.hypothesis_scores
         ],
         "overall_criteria": [asdict(c) for c in scores.overall_criteria],
+        "run_completed": scores.completed,
     }
 
 

@@ -88,6 +88,7 @@ def test_run_repeats_writes_one_record_per_unit(run_dir, tmp_path):
     assert all(r["ok"] for r in records)
     assert all(r["arm"] == "default" and r["temperature"] is None for r in records)
     assert judge[0]["result"]["hypotheses"][0]["criteria"][0]["criterion_id"] == "novelty"
+    assert judge[0]["result"]["run_completed"] is True
     assert judge[0]["calls"], "raw calls should be recorded"
     assert judge[0]["models_returned"] == ["mock"]
 

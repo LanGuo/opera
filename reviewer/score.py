@@ -31,6 +31,7 @@ class RunScores:
     overall_raw: str   # raw LLM text covering all overall rubric items
     run_dir: str
     overall_criteria: list[CriterionScore] = field(default_factory=list)  # structured overall scores
+    completed: bool = True  # False: no final_report.json (agent never called declare_done)
 
 
 # Fallback prompts used when task_spec.yaml is absent from the run directory.
@@ -283,13 +284,16 @@ def _score_criteria_two_pass(
 def score_run(
     run_dir: str, client: LLMClient | None = None, prompt_variant: str = "original",
 ) -> RunScores:
-    """Score a completed run. prompt_variant selects instruction wording (reviewer.prompt_variants)."""
+    """Score a run. prompt_variant selects instruction wording (reviewer.prompt_variants).
+
+    A run that ended without declare_done (e.g. at its turn cap) has no final report: its
+    active and terminal ledger hypotheses are scored with no termination rationale, confidence
+    summary, or suggested validation, and the result is marked completed=False.
+    """
     v = get_variant(prompt_variant)
     ws = Workspace(run_dir)
-    if not ws.final_report_path.exists():
-        raise FileNotFoundError(f"No final_report.json in {run_dir}. Run must be completed.")
-
-    report = json.loads(ws.final_report_path.read_text(encoding="utf-8"))
+    completed = ws.final_report_path.exists()
+    report = json.loads(ws.final_report_path.read_text(encoding="utf-8")) if completed else {}
     task_spec = ws.read_task_spec()
 
     if client is None:
@@ -405,6 +409,7 @@ def score_run(
         overall_raw=overall_raw,
         run_dir=run_dir,
         overall_criteria=overall_criteria,
+        completed=completed,
     )
 
 

@@ -178,10 +178,27 @@ def test_score_run_with_string_evidence_does_not_crash(tmp_path):
     assert len(scores.hypothesis_scores) == 1
 
 
-def test_score_run_no_report_raises(tmp_path):
-    Workspace(str(tmp_path / "empty_run"))
-    with pytest.raises(FileNotFoundError):
-        score_run(str(tmp_path / "empty_run"))
+def test_score_run_without_report_scores_ledger_and_marks_incomplete(tmp_path):
+    """A run that hit its turn cap before declare_done has no final_report.json;
+    its ledger is still scored, with no termination text, and flagged incomplete."""
+    ws = Workspace(str(tmp_path / "capped_run"))
+    def add(data):
+        data["hypotheses"] = {
+            "H001": {
+                "hypothesis_id": "H001", "cell_type": "monocyte", "candidate_gene": "SIGLEC1",
+                "claim": "elevated", "status": "active", "evidence": [{"type": "scrnaseq_deg"}],
+                "confidence": 0.7, "open_questions": [], "update_history": [],
+                "created_at": "2026-01-01T00:00:00+00:00",
+            },
+        }
+    ws.update_ledger(add)
+    scores = score_run(str(tmp_path / "capped_run"), client=MockLLMClient(MOCK_RESPONSE))
+    assert [hs.hypothesis_id for hs in scores.hypothesis_scores] == ["H001"]
+    assert scores.completed is False
+
+
+def test_score_run_with_report_is_complete(completed_run):
+    assert score_run(completed_run, client=MockLLMClient(MOCK_RESPONSE)).completed is True
 
 
 def test_score_run_falls_back_to_ledger_when_top_hypotheses_empty(tmp_path):
