@@ -21,6 +21,7 @@ launcher (`evaluator/run.py`, also installed as `bioagent-run`) supports two pro
 | Stopping | When the CLI exits, or at `--timeout-minutes` | Also 15 s after the CLI's first result record |
 | Agent's Python | Whatever is on the user's `PATH` | Fresh per-run venv (Python 3.12, via `uv`) first on `PATH`; user site-packages hidden |
 | Temp files | Shared `/tmp` | Per-run `TMPDIR` (and `CLAUDE_CODE_TMPDIR`); new `/tmp` entries the agent named are moved into the run directory |
+| ToolUniverse | `uvx tooluniverse` (unpinned) | Pinned version, started through `evaluator/tooluniverse_server.py` (see below) |
 | Task spec (rubric) | Copied into the run directory before the run | Copied in after the run |
 | Auth | Whatever the user's CLI is configured with | API keys only |
 
@@ -58,6 +59,13 @@ setups from the same command.
   shared by every Claude Code session on the machine, unless `CLAUDE_CODE_TMPDIR` is set. Agents
   also write to literal `/tmp/...` paths; the launcher moves new entries the transcript names into
   `harness/tmp_leftovers/` and lists the rest in the manifest. Run comparable runs one at a time.
+- **ToolUniverse is pinned and patched.** In ToolUniverse 1.5.8, running a compose tool such as
+  `BiomarkerDiscoveryWorkflow` over MCP unloads almost every other tool, including the server's
+  own `execute_tool`, for the rest of the session. The server registers tool names longer than 45
+  characters in shortened form; a compose tool checks its dependencies by full name, finds them
+  "missing", and auto-loads their category with a call that clears the registry by default
+  (2,797 tools → 156). `evaluator/tooluniverse_server.py` starts the pinned version with a patch
+  that fixes both; the manifest records the version (`tooluniverse`).
 - **The launcher enforces the end of the run.** It stops a matched run that is still running 15 s
   after its first result record, stops any run at `--timeout-minutes` (default 120), and kills the
   whole process group, including MCP servers and leftover shell commands.
@@ -112,6 +120,10 @@ Found while setting up matched runs (Claude Code 2.1.160, Gemini CLI 0.50.0):
   forwards it; MCP servers that validate arguments reject the call. Gemini models also sometimes
   guess tool names (e.g. `mcp_hypothesis_ledger_…` for the server `hypothesis-ledger`). Both show
   up in `tool_errors`; `reviewer.log_replay` doesn't count calls that never ran.
+- After a ToolUniverse compose tool runs under the unpatched server, every `execute_tool` call
+  answers "Tool 'execute_tool' not found even after loading tools" (see above). Large ToolUniverse
+  results are saved under `$TMPDIR`, which Gemini CLI's `read_file` refuses as outside the
+  workspace; matched runs add the run's temp directory to Gemini's `context.includeDirectories`.
 - Node writes to pipes asynchronously on macOS, so Gemini CLI's final result record can be lost
   when its output is read through a pipe; the launcher writes output straight to a file.
 

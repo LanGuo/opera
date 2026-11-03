@@ -3,7 +3,8 @@ import json
 import pytest
 
 from evaluator.harness import (
-    PILOT_GEMINI_PROMPT_TEMPLATE, PROFILES, plan_run, prepare_run, summarize_transcript,
+    PILOT_GEMINI_PROMPT_TEMPLATE, PROFILES, TOOLUNIVERSE_SERVER, TOOLUNIVERSE_VERSION, plan_run,
+    prepare_run, summarize_transcript,
 )
 
 
@@ -97,6 +98,13 @@ def test_matched_gemini_isolates_appends_and_caps(setup):
     assert all(s["trust"] for s in settings["mcpServers"].values())
 
 
+def test_matched_gemini_can_read_files_in_its_tmpdir(setup):
+    _, _, run_dir = setup
+    p = _plan(setup, "matched", "gemini-2.5-pro")
+    settings = json.loads(p.files[run_dir / "workspace" / ".gemini" / "settings.json"])
+    assert settings["context"]["includeDirectories"] == [p.env["TMPDIR"]]
+
+
 def test_matched_gemini_turn_cap_defaults_to_max_turns(setup):
     _, _, run_dir = setup
     p = _plan(setup, "matched", "gemini-2.5-pro")
@@ -114,6 +122,19 @@ def test_matched_configs_reference_tool_keys_without_writing_secrets(setup):
         assert "real-secret-value" not in text
         tu = json.loads(text)["mcpServers"]["tooluniverse"]["env"]
         assert tu["NCBI_API_KEY"] == "${NCBI_API_KEY}" and "BIOGRID_API_KEY" not in tu
+
+
+def test_matched_starts_pinned_tooluniverse_through_the_wrapper(setup):
+    _, _, run_dir = setup
+    for model, path in (("claude-sonnet-4-6", run_dir / "harness" / "mcp.json"),
+                        ("gemini-2.5-pro", run_dir / "workspace" / ".gemini" / "settings.json")):
+        p = _plan(setup, "matched", model)
+        tu = json.loads(p.files[path])["mcpServers"]["tooluniverse"]
+        assert tu["command"] == "uvx"
+        assert tu["args"] == ["--from", f"tooluniverse=={TOOLUNIVERSE_VERSION}", "python", "-P",
+                              str(TOOLUNIVERSE_SERVER)]
+        assert TOOLUNIVERSE_SERVER.is_file()
+        assert p.details["tooluniverse"].startswith(TOOLUNIVERSE_VERSION)
 
 
 def test_matched_keeps_rubric_out_of_reach_during_run(setup):

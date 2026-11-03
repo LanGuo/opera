@@ -25,6 +25,7 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from evaluator.tooluniverse_server import TOOLUNIVERSE_VERSION
 from reviewer.log_replay import gemini_response_count
 
 PROFILES = ("pilot", "matched")
@@ -38,6 +39,8 @@ CLAUDE_SUBAGENT_TOOLS = ("Agent", "Task")
 GEMINI_SUBAGENT_TOOL = "invoke_agent"
 # Python for each run's own environment. cellxgene-census's tiledbsoma doesn't build on 3.14.
 RUN_PYTHON = "3.12"
+# Pinned ToolUniverse, started through a wrapper that fixes compose tools wiping its registry.
+TOOLUNIVERSE_SERVER = Path(__file__).resolve().parent / "tooluniverse_server.py"
 
 
 @dataclass
@@ -74,7 +77,8 @@ def _mcp_servers(repo_root: Path, run_dir: Path, environ: dict, trust: bool) -> 
     # Reference keys by name so no secret is written into run artifacts; both CLIs expand ${VAR}.
     tool_env = {"PYTHONIOENCODING": "utf-8"}
     tool_env.update({k: "${%s}" % k for k in TOOLUNIVERSE_KEYS if environ.get(k)})
-    tools = {"command": "uvx", "args": ["tooluniverse"], "env": tool_env}
+    tools = {"command": "uvx", "args": ["--from", f"tooluniverse=={TOOLUNIVERSE_VERSION}", "python",
+                                        "-P", str(TOOLUNIVERSE_SERVER)], "env": tool_env}
     if trust:
         ledger["trust"] = tools["trust"] = True
     return {"hypothesis-ledger": ledger, "tooluniverse": tools}
@@ -123,7 +127,9 @@ def plan_run(
                "VIRTUAL_ENV": str(venv), "PYTHONNOUSERSITE": "1", "TMPDIR": str(tmp)}
     isolation = dict(venv=venv, sweep_tmp=True)
     env_details = {"python_env": f"fresh venv (Python {RUN_PYTHON}) first on PATH, user site hidden",
-                   "tmpdir": "per-run TMPDIR; new /tmp entries the agent named are moved into the run dir"}
+                   "tmpdir": "per-run TMPDIR; new /tmp entries the agent named are moved into the run dir",
+                   "tooluniverse": f"{TOOLUNIVERSE_VERSION}, compose-tool registry fix "
+                                   "(evaluator/tooluniverse_server.py)"}
     if harness == "claude":
         home, task_file, mcp_file = hdir / "claude-home", hdir / "agent_task.md", hdir / "mcp.json"
         servers = _mcp_servers(repo_root, run_dir, environ, trust=False)
@@ -157,8 +163,10 @@ def plan_run(
     servers = _mcp_servers(repo_root, run_dir, environ, trust=True)
     # experimental.enableAgents only gates user-defined agents; the built-in ones stay reachable
     # through invoke_agent unless the tool itself is excluded.
+    # ToolUniverse saves large results under TMPDIR, outside the workspace, and Gemini CLI's file
+    # tools refuse paths outside the workspace unless the directory is included (Claude's don't).
     settings = {"model": {"maxSessionTurns": cap}, "tools": {"exclude": [GEMINI_SUBAGENT_TOOL]},
-                "mcpServers": servers}
+                "context": {"includeDirectories": [str(tmp)]}, "mcpServers": servers}
     argv = ["gemini", "-p", USER_PROMPT, "--model", model, "--output-format", "stream-json",
             "--approval-mode", "yolo", "--skip-trust"]
     return HarnessPlan(
