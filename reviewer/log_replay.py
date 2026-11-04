@@ -104,13 +104,23 @@ def _universe_tool(name: str, args) -> str | None:
 
 
 def _confidence_sequence(h: dict) -> list[float]:
-    """Extract chronological confidence values from a hypothesis entry."""
-    init = h.get("confidence")
-    seq = [init] if init is not None else []
+    """Extract chronological confidence values from a hypothesis entry.
+
+    update_hypothesis overwrites "confidence" in place, so the entry holds the latest value; the
+    starting value is the "from" side of the first update that changed confidence.
+    """
+    seq: list[float] = []
     for update in h.get("update_history", []):
-        new_conf = update.get("changes", {}).get("to", {}).get("confidence")
-        if new_conf is not None:
-            seq.append(float(new_conf))
+        changes = update.get("changes", {})
+        new_conf = changes.get("to", {}).get("confidence")
+        if new_conf is None:
+            continue
+        old_conf = changes.get("from", {}).get("confidence")
+        if not seq and old_conf is not None:
+            seq.append(float(old_conf))
+        seq.append(float(new_conf))
+    if not seq and h.get("confidence") is not None:
+        seq.append(float(h["confidence"]))
     return seq
 
 
@@ -118,7 +128,8 @@ def _martingale_score(sequences: list[list[float]]) -> tuple[float | None, int]:
     """Pearson r between b_t and (b_{t+1} - b_t) pooled across all hypothesis sequences.
 
     Returns (r, n) where n is the number of (b_t, Δb_t) pairs used.
-    Returns (None, n) if n < 3 — too few pairs for a reliable estimate.
+    Returns (None, n) if n < 3 — too few pairs for a reliable estimate — or if every b_t or every
+    Δb_t is the same, where r is undefined.
 
     Near-zero r: evidence-driven updates.
     Positive r: belief entrenchment (high confidence tends to keep rising).
@@ -137,7 +148,7 @@ def _martingale_score(sequences: list[list[float]]) -> tuple[float | None, int]:
     sx = sum((x - mx) ** 2 for x in xs) ** 0.5
     sy = sum((y - my) ** 2 for y in ys) ** 0.5
     if sx == 0 or sy == 0:
-        return 0.0, n
+        return None, n
     return cov / (sx * sy), n
 
 
@@ -431,7 +442,7 @@ def print_report(metrics: RunMetrics) -> None:
     print(f"Revisions/hypothesis:  {rph:.2f}" if rph is not None else "Revisions/hypothesis:  N/A")
     print(f"Refutation rate:       {metrics.refutation_rate:.1%}")
     ms = metrics.martingale_score
-    ms_str = f"{ms:.3f} (n={metrics.martingale_n} pairs)" if ms is not None else f"N/A (n={metrics.martingale_n} pairs, need ≥3)"
+    ms_str = f"{ms:.3f} (n={metrics.martingale_n} pairs)" if ms is not None else f"N/A (n={metrics.martingale_n} pairs; needs ≥3 and varying values)"
     print(f"Martingale score:      {ms_str}")
     print(f"Directional flips:     {metrics.directional_flip_count}")
     tc = metrics.turn_count

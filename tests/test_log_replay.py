@@ -187,7 +187,7 @@ def test_confidence_sequence_initial_only():
 
 def test_confidence_sequence_with_updates():
     h = {
-        "confidence": 0.5,
+        "confidence": 0.4,
         "update_history": [
             {"changes": {"from": {"confidence": 0.5}, "to": {"confidence": 0.7}}},
             {"changes": {"from": {"confidence": 0.7}, "to": {"confidence": 0.4}}},
@@ -197,13 +197,41 @@ def test_confidence_sequence_with_updates():
 
 def test_confidence_sequence_skips_updates_without_confidence():
     h = {
-        "confidence": 0.5,
+        "confidence": 0.3,
         "update_history": [
             {"changes": {"from": {"status": "active"}, "to": {"status": "weakened"}}},
             {"changes": {"from": {"confidence": 0.5}, "to": {"confidence": 0.3}}},
         ],
     }
     assert _confidence_sequence(h) == [0.5, 0.3]
+
+def test_confidence_sequence_starts_from_first_update_not_current_value():
+    # update_hypothesis overwrites "confidence" in place, so the ledger holds the latest value
+    h = {
+        "confidence": 0.4,
+        "update_history": [
+            {"changes": {"from": {"confidence": 0.65}, "to": {"confidence": 0.5}}},
+            {"changes": {"from": {"status": "active"}, "to": {"status": "weakened"}}},
+            {"changes": {"from": {"confidence": 0.5}, "to": {"confidence": 0.4}}},
+        ],
+    }
+    assert _confidence_sequence(h) == [0.65, 0.5, 0.4]
+
+def test_confidence_sequence_status_only_updates_keep_current_value():
+    h = {
+        "confidence": 0.6,
+        "update_history": [{"changes": {"from": {"status": "active"}, "to": {"status": "terminal"}}}],
+    }
+    assert _confidence_sequence(h) == [0.6]
+
+def test_martingale_score_none_when_all_starting_values_equal():
+    # Every b_t is 0.6: r is undefined, not 0
+    r, n = _martingale_score([[0.6, 0.8], [0.6, 0.8], [0.6, 0.7]])
+    assert r is None and n == 3
+
+def test_martingale_score_none_when_no_confidence_changes():
+    r, n = _martingale_score([[0.5, 0.5], [0.7, 0.7], [0.3, 0.3]])
+    assert r is None and n == 3
 
 def test_martingale_score_none_for_insufficient_data():
     r, n = _martingale_score([[0.5, 0.6]])  # only 1 pair, need >= 3
