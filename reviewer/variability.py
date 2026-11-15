@@ -108,11 +108,15 @@ def _judge_result(scores) -> dict:
             {
                 "hypothesis_id": hs.hypothesis_id,
                 "candidate_gene": hs.candidate_gene,
+                "status": hs.status,
+                "final_candidate": hs.final_candidate,
+                "input_stats": hs.input_stats,
                 "criteria": [asdict(c) for c in hs.criteria],
             }
             for hs in scores.hypothesis_scores
         ],
         "overall_criteria": [asdict(c) for c in scores.overall_criteria],
+        "overall_input_stats": scores.overall_input_stats,
         "run_completed": scores.completed,
     }
 
@@ -295,6 +299,9 @@ def _rankings(judge: list[dict]) -> list[dict]:
                 v for v in (_numeric(c["score"]) for c in h["criteria"]) if v is not None
             )
             for h in r["result"]["hypotheses"]
+            # Rankings are over the agent's final candidates; weakened/refuted ones are scored
+            # too but are not part of the ranking. Older records have no flag.
+            if h.get("final_candidate", True)
         }
         if len(totals) >= 2:
             orderings[(r["run_id"], r["arm"], r["backend"])][_ordering(totals)] += 1
@@ -375,6 +382,72 @@ def _human_mad(judge: list[dict], human_scores: dict) -> tuple[list[dict], list[
     return per_backend, gaps
 
 
+def _ranks(xs: list[float]) -> list[float]:
+    order = sorted(range(len(xs)), key=lambda i: xs[i])
+    out = [0.0] * len(xs)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and xs[order[j + 1]] == xs[order[i]]:
+            j += 1
+        for k in range(i, j + 1):
+            out[order[k]] = (i + j) / 2
+        i = j + 1
+    return out
+
+
+def _spearman(x: list[float], y: list[float]) -> float | None:
+    if len(x) < 4 or len(set(x)) < 2 or len(set(y)) < 2:
+        return None
+    return statistics.correlation(_ranks(x), _ranks(y))
+
+
+def _partial_spearman(x: list[float], y: list[float], z: list[float]) -> float | None:
+    """Rank correlation of x and y holding z fixed (first-order partial)."""
+    rxy, rxz, ryz = _spearman(x, y), _spearman(x, z), _spearman(y, z)
+    if None in (rxy, rxz, ryz) or abs(rxz) >= 1 or abs(ryz) >= 1:
+        return None
+    return (rxy - rxz * ryz) / ((1 - rxz ** 2) * (1 - ryz ** 2)) ** 0.5
+
+
+def _input_size(judge: list[dict]) -> list[dict]:
+    """Does the per-hypothesis judge score follow the size of what it was shown?
+
+    Unit = (run, hypothesis): mean numeric score over criteria and repeats, against the recorded
+    input_stats (older records have none and are skipped). chars_given_items is the
+    partial correlation of score with evidence characters holding the number of items fixed —
+    the part of a length effect that item count doesn't explain. Positive values are a warning,
+    not proof: longer evidence can also be better evidence.
+    """
+    units: dict[tuple, dict] = {}
+    for r in judge:
+        for h in r["result"]["hypotheses"]:
+            st = h.get("input_stats") or {}
+            nums = [v for v in (_numeric(c["score"]) for c in h["criteria"]) if v is not None]
+            if not st or not nums:
+                continue
+            u = units.setdefault((r["arm"], r["backend"], r["run_id"], h["hypothesis_id"]),
+                                 {"scores": [], "stats": st})
+            u["scores"].extend(nums)
+    by_group: dict[tuple, list[dict]] = defaultdict(list)
+    for (arm, backend, _, _), u in units.items():
+        by_group[(arm, backend)].append(u)
+    out = []
+    for (arm, backend), us in sorted(by_group.items()):
+        score = [statistics.fmean(u["scores"]) for u in us]
+        items = [u["stats"].get("evidence_items", 0) for u in us]
+        chars = [u["stats"].get("evidence_chars", 0) for u in us]
+        rat = [u["stats"].get("rationale_chars", 0) for u in us]
+        out.append({
+            "arm": arm, "backend": backend, "n_hypotheses": len(us),
+            "score_vs_items": _spearman(items, score),
+            "score_vs_chars": _spearman(chars, score),
+            "chars_given_items": _partial_spearman(chars, score, items),
+            "score_vs_rationale_chars": _spearman(rat, score),
+        })
+    return out
+
+
 def _observer(observer: list[dict], genes: dict) -> list[dict]:
     rows_by_key: dict[tuple, list[dict]] = defaultdict(list)
     for r in observer:
@@ -445,6 +518,7 @@ def summarize(records: list[dict], human_scores: dict | None = None) -> dict:
         "human_mad": human_mad,
         "human_mad_gap": human_mad_gap,
         "observer": _observer(observer, genes),
+        "input_size": _input_size(judge),
     }
 
 
@@ -580,6 +654,14 @@ def format_summary(s: dict) -> str:
             lines.append(f"{r['run_id']} {r['arm']}: Claude closer to human in "
                          f"{r['frac_anthropic_closer']:.0%} of {r['n_pairs']} pairs "
                          f"{_label(r['stable'])}")
+
+    if s.get("input_size"):
+        section("Judge score vs. input size (Spearman over hypotheses; records with input stats only)")
+        fmt = lambda v: "  n/a" if v is None else f"{v:+.2f}"
+        for r in s["input_size"]:
+            lines.append(f"{r['arm']} {r['backend']}: n={r['n_hypotheses']}  items {fmt(r['score_vs_items'])}  "
+                         f"chars {fmt(r['score_vs_chars'])}  chars|items {fmt(r['chars_given_items'])}  "
+                         f"rationale chars {fmt(r['score_vs_rationale_chars'])}")
 
     section("Falsification observer confidence vs. agent's final confidence")
     for r in s["observer"]:

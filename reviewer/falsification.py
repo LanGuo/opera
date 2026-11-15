@@ -2,6 +2,7 @@ import json
 import re
 from dataclasses import dataclass
 
+from reviewer.evidence import evidence_for_judging, evidence_parts
 from reviewer.llm import LLMClient, extract_json_object, get_llm_client
 from reviewer.prompt_variants import get_variant, observer_system
 
@@ -101,10 +102,8 @@ class FalsificationResult:
 
 
 def _evidence_text(item) -> str:
-    """Return a plain-text representation of an evidence item (str or dict)."""
-    if isinstance(item, str):
-        return item
-    return item.get("description", "") + " " + item.get("source", "")
+    """Plain text of an evidence item (str or dict with any of the key sets agents use)."""
+    return evidence_parts(item)[1]
 
 
 def _extract_e_values_from_text(evidence: list) -> float:
@@ -184,7 +183,8 @@ def assess_hypothesis(
     gene = hypothesis.get("candidate_gene", "")
     cell_type = hypothesis.get("cell_type", "")
     claim = hypothesis.get("claim", "")
-    evidence = hypothesis.get("evidence", [])
+    # Every item ever recorded, not just the last list an update sent (see reviewer.evidence).
+    evidence = [item for item, _ in evidence_for_judging(hypothesis)]
 
     user = f"Hypothesis: {gene} in {cell_type} — {claim}\n\nEvidence items:\n"
     for i, e in enumerate(evidence):
@@ -312,6 +312,6 @@ def assess_terminal_hypotheses(
     data = ws.read_ledger()
     to_assess = [
         h for h in data.get("hypotheses", {}).values()
-        if h.get("status") != "refuted" and h.get("evidence")
+        if h.get("status") != "refuted" and evidence_for_judging(h)
     ]
     return [assess_hypothesis(h, c, prompt_variant) for h in to_assess]

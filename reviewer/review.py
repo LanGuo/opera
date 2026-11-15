@@ -137,6 +137,8 @@ def build_review_data(run_dir: str, llm_scores=None) -> dict:
                 entry = hyp_map.setdefault(hs.hypothesis_id, {
                     "hypothesis_id": hs.hypothesis_id,
                     "gene": hs.candidate_gene,
+                    "status": getattr(hs, "status", ""),
+                    "final_candidate": getattr(hs, "final_candidate", True),
                     "scores_by_backend": {},
                 })
                 entry["scores_by_backend"][backend_key] = {
@@ -647,7 +649,10 @@ def _render_locked(data: dict, falsification_scores_html: str = "") -> str:
                     '<div class="hypothesis-header">'
                     f'<span class="h-gene">{_esc(hs["gene"])}</span>'
                     f' <span style="color:#999">({_esc(hs["hypothesis_id"])})</span>'
-                    "</div>"
+                    + ("" if hs.get("final_candidate", True) else
+                       f' <span style="color:#a33">&middot; {_esc(hs.get("status", ""))} by the agent '
+                       '(not a final candidate)</span>')
+                    + "</div>"
                 )
                 if n_backends > 1:
                     header += (
@@ -971,6 +976,8 @@ def generate_review_html(run_dir, metrics, scores=None, falsification_results=No
                 entry = hyp_map.setdefault(hs.hypothesis_id, {
                     "hypothesis_id": hs.hypothesis_id,
                     "gene": hs.candidate_gene,
+                    "status": getattr(hs, "status", ""),
+                    "final_candidate": getattr(hs, "final_candidate", True),
                     "scores_by_backend": {},
                 })
                 entry["scores_by_backend"][backend_key] = {

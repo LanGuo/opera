@@ -5,6 +5,9 @@ import sys
 from dataclasses import dataclass, field
 
 from hypothesis_ledger.workspace import Workspace
+from reviewer.evidence import (
+    DROPPED, SUPERSEDED, all_evidence, evidence_for_judging, evidence_parts, format_evidence_list,
+)
 from reviewer.llm import LLMClient, extract_json_object, get_llm_client
 from reviewer.prompt_variants import PromptVariant, get_variant
 
@@ -23,6 +26,11 @@ class HypothesisScores:
     candidate_gene: str
     per_hypothesis_raw: str  # raw LLM text covering all per_hypothesis rubric items
     criteria: list[CriterionScore] = field(default_factory=list)  # structured per-criterion scores
+    status: str = ""  # ledger status at end of run; "weakened"/"refuted" ones aren't final candidates
+    final_candidate: bool = True  # False for weakened/refuted hypotheses scored for completeness
+    # Size of what the judge was shown (see _hypothesis_input_stats), recorded so score-vs-length
+    # can be checked after the fact.
+    input_stats: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -32,6 +40,7 @@ class RunScores:
     run_dir: str
     overall_criteria: list[CriterionScore] = field(default_factory=list)  # structured overall scores
     completed: bool = True  # False: no final_report.json (agent never called declare_done)
+    overall_input_stats: dict = field(default_factory=dict)  # size of the overall-pass inputs
 
 
 # Fallback prompts used when task_spec.yaml is absent from the run directory.
@@ -77,12 +86,22 @@ Significance score: X/5
 # collided with the block splitter. In JSON the model's prose stays inside string values.
 
 
+# Fixed across prompt variants (like the observer's e-value method): how to weigh evidence, so the
+# score doesn't follow item count or text length. Saved runs showed pass-1 scores rising with the
+# number of evidence items and, across agents, with characters per item.
+_EVIDENCE_WEIGHING = (
+    "How to weigh the evidence: judge what each item shows, not how many items there are or how "
+    "long they are. Items that restate the same finding, or come from the same source or analysis, "
+    "count as one line of evidence. A short item with a quantified result can outweigh several long "
+    "descriptive ones. Do not raise a score because the record is longer or lower it because it is "
+    "terse; score the strength and independence of what is actually shown."
+)
+
+
 def _evidence_text(item, default_type: str = "unknown") -> tuple[str, str]:
-    """Return (type, description) for an evidence item that may be a plain string
-    (Gemini's format) or a dict (Claude's format)."""
-    if isinstance(item, str):
-        return default_type, item
-    return item.get("type", default_type), item.get("description", "")
+    """Return (type, text) for an evidence item: a plain string (Gemini's format) or a dict
+    with any of the key sets agents use (see reviewer.evidence.evidence_parts)."""
+    return evidence_parts(item, default_type)
 
 
 def _format_evidence_trail(update_history: list) -> str:
@@ -108,17 +127,102 @@ def _format_open_questions(open_questions: list | None) -> str:
 
 
 def _format_refuted_hypotheses(all_hypotheses: dict) -> str:
-    refuted = [h for h in all_hypotheses.values() if h.get("status") == "refuted"]
-    if not refuted:
+    """Refuted and weakened hypotheses with a short evidence summary (weakened listed separately:
+    the agent lowered them below its final candidates without rejecting them outright)."""
+    sections = []
+    for status, heading in (
+        ("refuted", "Refuted hypotheses (agent discarded these during the run):"),
+        ("weakened", "Weakened hypotheses (agent downgraded these during the run):"),
+    ):
+        hs = [h for h in all_hypotheses.values() if h.get("status") == status]
+        if not hs:
+            continue
+        lines = [heading]
+        for h in hs:
+            gene = h.get("candidate_gene", "unknown")
+            cell_type = h.get("cell_type", "unknown")
+            descriptions = [_evidence_text(e)[1] for e, _ in evidence_for_judging(h)]
+            ev_summary = "; ".join(d[:120] for d in descriptions if d)
+            lines.append(f"  - {cell_type}/{gene}: evidence found — {ev_summary or 'none'}")
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections)
+
+
+_SCORED_STATUSES = ("terminal", "active")
+_DISCARDED_STATUSES = ("weakened", "refuted")
+
+
+def _hypotheses_to_score(report: dict, all_hypotheses: dict) -> list[dict]:
+    """The agent's final candidates, then every weakened or refuted hypothesis.
+
+    Final candidates are the report's top_hypotheses, or the active/terminal ledger entries when
+    the run has no report (or an empty list). Weakened/refuted ones were previously never scored,
+    so the judge never saw how the agent handled disconfirmation; they are appended, taking their
+    status from the ledger.
+    """
+    top = list(report.get("top_hypotheses") or [])
+    if not top:
+        top = [h for h in all_hypotheses.values() if h.get("status") in _SCORED_STATUSES]
+    seen = {h.get("hypothesis_id") for h in top}
+    discarded = [
+        h for h in all_hypotheses.values()
+        if h.get("status") in _DISCARDED_STATUSES and h.get("hypothesis_id") not in seen
+    ]
+    return top + discarded
+
+
+def _run_metrics(all_hypotheses: dict, scored: list[dict]) -> dict:
+    """Run-level counts over every hypothesis the agent formed.
+
+    Previously computed over the final candidates only, which by construction contain no refuted
+    hypotheses, so the judge was shown a 0% refutation rate for every run.
+    """
+    pool = list(all_hypotheses.values()) or scored
+    n = len(pool)
+    by_status = {s: sum(1 for h in pool if h.get("status") == s) for s in _DISCARDED_STATUSES}
+    return {
+        "hypothesis_count": n,
+        "final_count": sum(1 for h in pool if h.get("status") in _SCORED_STATUSES),
+        "weakened_count": by_status["weakened"],
+        "refuted_count": by_status["refuted"],
+        "belief_revision_count": sum(len(h.get("update_history") or []) for h in pool),
+        "refutation_rate": by_status["refuted"] / max(n, 1),
+        "weakened_rate": by_status["weakened"] / max(n, 1),
+    }
+
+
+def _hypothesis_input_stats(h: dict, evidence_str: str, trail: str, rationale: str) -> dict:
+    """How much the judge was shown for one hypothesis. Item counts follow what the prompt lists
+    (final + dropped items; superseded rewordings are not shown but counted separately)."""
+    states = [s for _, s in all_evidence(h)]
+    return {
+        "evidence_items": sum(1 for s in states if s != SUPERSEDED),
+        "dropped_items": states.count(DROPPED),
+        "superseded_items": states.count(SUPERSEDED),
+        "evidence_chars": len(evidence_str),
+        "trail_lines": max(len(trail.splitlines()) - 1, 0) if trail else 0,
+        "rationale_chars": len(rationale or ""),
+    }
+
+
+def _hypothesis_label(h: dict) -> str:
+    return f"{h.get('cell_type', 'unknown')} / {h.get('candidate_gene', 'unknown')}"
+
+
+def _format_hypothesis_table(scored: list[dict], final_ids: set) -> str:
+    """Every hypothesis the judge scores, for the overall pass: label, status, claim, how much
+    evidence and how many revisions. No confidence numbers (pass 1 excludes agent confidence)."""
+    if not scored:
         return ""
-    lines = ["Refuted hypotheses (agent discarded these during the run):"]
-    for h in refuted:
-        gene = h.get("candidate_gene", "unknown")
-        cell_type = h.get("cell_type", "unknown")
-        evidence = h.get("evidence", [])
-        descriptions = [_evidence_text(e)[1] for e in evidence]
-        ev_summary = "; ".join(d[:120] for d in descriptions if d)
-        lines.append(f"  - {cell_type}/{gene}: evidence found — {ev_summary or 'none'}")
+    lines = ["Hypotheses at the end of the run:"]
+    for h in scored:
+        role = "final candidate" if h.get("hypothesis_id") in final_ids else h.get("status", "unknown")
+        n_ev = len(evidence_for_judging(h))
+        n_up = len(h.get("update_history") or [])
+        lines.append(
+            f"  - {_hypothesis_label(h)} [{role}]: {h.get('claim', '')} "
+            f"(evidence items: {n_ev}; revisions: {n_up})"
+        )
     return "\n".join(lines)
 
 
@@ -149,7 +253,7 @@ def _build_per_hypothesis_prompt_pass1(
         f"Task goal: {goal}\n",
         f"{v.judge_role}\n",
         f"Hypothesis: {hypothesis_str}",
-        f"Final evidence:\n{evidence_str}",
+        f"Evidence recorded by the agent:\n{evidence_str}",
     ]
     if evidence_trail:
         parts.append(evidence_trail)
@@ -157,6 +261,7 @@ def _build_per_hypothesis_prompt_pass1(
         parts.append(open_questions_str)
     if validation:
         parts.append(f"Proposed validation: {validation}")
+    parts.append(_EVIDENCE_WEIGHING)
     parts.append(v.judge_pass1_format)
     parts.append(_format_criteria_listing(per_items))
     return "\n\n".join(parts)
@@ -177,17 +282,24 @@ def _build_per_hypothesis_prompt_pass2(
 
 def _build_overall_prompt_pass1(
     goal: str, overall_items: list, metrics: dict, refuted_str: str, v: PromptVariant,
+    hypothesis_table: str = "",
 ) -> str:
+    n = metrics["hypothesis_count"]
     parts = [
         f"Task goal: {goal}\n",
         f"{v.judge_role}\n",
         "Run summary:",
-        f"  Hypotheses formed: {metrics['hypothesis_count']}",
-        f"  Belief revisions: {metrics['belief_revision_count']}",
+        f"  Hypotheses formed: {n} (final candidates: {metrics.get('final_count', n)}, "
+        f"weakened: {metrics.get('weakened_count', 0)}, refuted: {metrics.get('refuted_count', 0)})",
+        f"  Belief revisions (all hypotheses): {metrics['belief_revision_count']}",
         f"  Refutation rate: {metrics['refutation_rate']:.0%}",
+        f"  Weakened rate: {metrics.get('weakened_rate', 0.0):.0%}",
     ]
+    if hypothesis_table:
+        parts.append(f"\n{hypothesis_table}")
     if refuted_str:
         parts.append(f"\n{refuted_str}")
+    parts.append(_EVIDENCE_WEIGHING)
     parts.append(v.judge_pass1_format)
     parts.append(_format_criteria_listing(overall_items))
     return "\n\n".join(parts)
@@ -254,7 +366,7 @@ def _parse_json_agent_notes(raw: str) -> dict[str, str]:
 
 def _score_criteria_two_pass(
     client: LLMClient, prompt1: str, rubric_items: list,
-    build_prompt2: "callable | None", raw_label: str,
+    build_prompt2: "callable | None", raw_label: str, stats: dict | None = None,
 ) -> tuple[str, list[CriterionScore]]:
     """Run pass-1 scoring, then optionally pass-2 (agent-note-only) annotation.
 
@@ -267,9 +379,14 @@ def _score_criteria_two_pass(
     pass1 = client.chat([{"role": "user", "content": prompt1}])
     criteria = _parse_json_criteria(pass1, rubric_items)
     raw_display = pass1
+    if stats is not None:
+        stats["pass1_prompt_chars"] = len(prompt1)
+        stats["pass2_prompt_chars"] = 0  # 0 = pass 2 skipped
 
     if build_prompt2 is not None and criteria:
         prompt2 = build_prompt2(criteria)
+        if stats is not None:
+            stats["pass2_prompt_chars"] = len(prompt2)
         pass2 = client.chat([{"role": "user", "content": prompt2}])
         notes = _parse_json_agent_notes(pass2)
         if notes:
@@ -302,12 +419,9 @@ def score_run(
     ledger = ws.read_ledger()
     all_hypotheses = ledger.get("hypotheses", {})
 
-    top_hypotheses = report.get("top_hypotheses") or []
-    if not top_hypotheses:
-        top_hypotheses = [
-            h for h in all_hypotheses.values()
-            if h.get("status") in ("terminal", "active")
-        ]
+    scored_hypotheses = _hypotheses_to_score(report, all_hypotheses)
+    top_hypotheses = [h for h in scored_hypotheses if h.get("status") not in _DISCARDED_STATUSES]
+    final_ids = {h.get("hypothesis_id") for h in top_hypotheses}
 
     validation = report.get("suggested_validation", "")
     termination_rationale = report.get("rationale", "")
@@ -320,12 +434,18 @@ def score_run(
         overall_items = [r for r in task_spec.get("rubric", []) if r.get("scope") == "overall"]
         goal = task_spec.get("goal", "")
 
-        for h in top_hypotheses:
+        for h in scored_hypotheses:
             gene = h.get("candidate_gene", "unknown")
             cell_type = h.get("cell_type", "unknown")
             claim = h.get("claim", "")
-            evidence_str = json.dumps(h.get("evidence", []))
+            status = h.get("status", "")
+            is_final = h.get("hypothesis_id") in final_ids
+            evidence_str = format_evidence_list(h)
             hypothesis_str = f"{cell_type} / {gene}: {claim}"
+            if not is_final:
+                hypothesis_str += (
+                    f"\nStatus at end of run: {status} (the agent did not keep this as a final candidate)"
+                )
             update_history = h.get("update_history", [])
             open_questions = h.get("open_questions")
 
@@ -339,6 +459,7 @@ def score_run(
 
             per_hyp_raw = ""
             criteria: list[CriterionScore] = []
+            input_stats = _hypothesis_input_stats(h, evidence_str, evidence_trail, agent_rationale)
             if per_items:
                 prompt1 = _build_per_hypothesis_prompt_pass1(
                     goal, per_items, hypothesis_str, evidence_str,
@@ -349,35 +470,39 @@ def score_run(
                     if agent_rationale else None
                 )
                 per_hyp_raw, criteria = _score_criteria_two_pass(
-                    client, prompt1, per_items, build_prompt2, "per-hypothesis",
+                    client, prompt1, per_items, build_prompt2, "per-hypothesis", input_stats,
                 )
             scores.append(HypothesisScores(
                 hypothesis_id=h.get("hypothesis_id", "unknown"),
                 candidate_gene=gene,
                 per_hypothesis_raw=per_hyp_raw,
                 criteria=criteria,
+                status=status,
+                final_candidate=is_final,
+                input_stats=input_stats,
             ))
 
         overall_raw = ""
         overall_criteria: list[CriterionScore] = []
+        overall_input_stats: dict = {}
         if overall_items:
-            n_hyps = len(top_hypotheses)
-            metrics_summary = {
-                "hypothesis_count": n_hyps,
-                "belief_revision_count": sum(
-                    len(h.get("update_history", [])) for h in top_hypotheses
-                ),
-                "refutation_rate": sum(
-                    1 for h in top_hypotheses if h.get("status") == "refuted"
-                ) / max(n_hyps, 1),
+            metrics_summary = _run_metrics(all_hypotheses, scored_hypotheses)
+            hypothesis_table = _format_hypothesis_table(scored_hypotheses, final_ids)
+            prompt1 = _build_overall_prompt_pass1(
+                goal, overall_items, metrics_summary, refuted_str, v,
+                hypothesis_table=hypothesis_table,
+            )
+            overall_input_stats = {
+                "hypotheses_listed": len(scored_hypotheses),
+                "hypothesis_table_chars": len(hypothesis_table),
+                "rationale_chars": len(termination_rationale or "") + len(confidence_summary or ""),
             }
-            prompt1 = _build_overall_prompt_pass1(goal, overall_items, metrics_summary, refuted_str, v)
             build_prompt2 = (
                 (lambda crit: _build_overall_prompt_pass2(crit, termination_rationale, confidence_summary, v))
                 if (termination_rationale or confidence_summary) else None
             )
             overall_raw, overall_criteria = _score_criteria_two_pass(
-                client, prompt1, overall_items, build_prompt2, "overall",
+                client, prompt1, overall_items, build_prompt2, "overall", overall_input_stats,
             )
 
     else:
@@ -403,6 +528,7 @@ def score_run(
             ))
         overall_raw = ""
         overall_criteria = []
+        overall_input_stats = {}
 
     return RunScores(
         hypothesis_scores=scores,
@@ -410,6 +536,7 @@ def score_run(
         run_dir=run_dir,
         overall_criteria=overall_criteria,
         completed=completed,
+        overall_input_stats=overall_input_stats,
     )
 
 
