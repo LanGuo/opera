@@ -125,15 +125,15 @@ def test_matched_configs_reference_tool_keys_without_writing_secrets(setup):
         assert tu["NCBI_API_KEY"] == "${NCBI_API_KEY}" and "BIOGRID_API_KEY" not in tu
 
 
-def test_matched_starts_pinned_tooluniverse_through_the_wrapper(setup):
+def test_matched_starts_pinned_tooluniverse_with_census(setup):
     _, _, run_dir = setup
     for model, path in (("claude-sonnet-4-6", run_dir / "harness" / "mcp.json"),
                         ("gemini-2.5-pro", run_dir / "workspace" / ".gemini" / "settings.json")):
         p = _plan(setup, "matched", model)
         tu = json.loads(p.files[path])["mcpServers"]["tooluniverse"]
         assert tu["command"] == "uvx"
-        assert tu["args"] == ["--from", f"tooluniverse=={TOOLUNIVERSE_VERSION}", "python", "-P",
-                              str(TOOLUNIVERSE_SERVER)]
+        assert tu["args"] == ["--python", "3.12", "--from", f"tooluniverse=={TOOLUNIVERSE_VERSION}",
+                              "--with", "cellxgene-census", "python", "-P", str(TOOLUNIVERSE_SERVER)]
         assert TOOLUNIVERSE_SERVER.is_file()
         assert p.details["tooluniverse"].startswith(TOOLUNIVERSE_VERSION)
 

@@ -30,7 +30,7 @@ from pathlib import Path
 
 import yaml
 
-from evaluator.tooluniverse_server import TOOLUNIVERSE_VERSION
+from evaluator.tooluniverse_server import EXTRA_ENV, EXTRA_PACKAGES, PYTHON as TOOLUNIVERSE_PYTHON, TOOLUNIVERSE_VERSION
 from evaluator.turn_budget import HOOK_EVENTS
 from hypothesis_ledger.instructions import ledger_instructions
 from hypothesis_ledger.ledger import task_rules_from_spec
@@ -47,7 +47,7 @@ CLAUDE_SUBAGENT_TOOLS = ("Agent", "Task")
 GEMINI_SUBAGENT_TOOL = "invoke_agent"
 # Python for each run's own environment. cellxgene-census's tiledbsoma doesn't build on 3.14.
 RUN_PYTHON = "3.12"
-# Pinned ToolUniverse, started through a wrapper that fixes compose tools wiping its registry.
+# Pinned ToolUniverse, started through a launcher that checks the version.
 TOOLUNIVERSE_SERVER = Path(__file__).resolve().parent / "tooluniverse_server.py"
 
 
@@ -85,9 +85,11 @@ def _mcp_servers(repo_root: Path, run_dir: Path, environ: dict, trust: bool) -> 
         "env": {"ALLOW_HUMAN_INPUT": "false", "EVAL_RUN_DIR": str(run_dir)},
     }
     # Reference keys by name so no secret is written into run artifacts; both CLIs expand ${VAR}.
-    tool_env = {"PYTHONIOENCODING": "utf-8"}
+    tool_env = {"PYTHONIOENCODING": "utf-8", **EXTRA_ENV}
     tool_env.update({k: "${%s}" % k for k in TOOLUNIVERSE_KEYS if environ.get(k)})
-    tools = {"command": "uvx", "args": ["--from", f"tooluniverse=={TOOLUNIVERSE_VERSION}", "python",
+    extras = [a for pkg in EXTRA_PACKAGES for a in ("--with", pkg)]
+    tools = {"command": "uvx", "args": ["--python", TOOLUNIVERSE_PYTHON, "--from",
+                                        f"tooluniverse=={TOOLUNIVERSE_VERSION}", *extras, "python",
                                         "-P", str(TOOLUNIVERSE_SERVER)], "env": tool_env}
     if trust:
         ledger["trust"] = tools["trust"] = True
@@ -168,8 +170,8 @@ def plan_run(
     isolation = dict(venv=venv, sweep_tmp=True)
     env_details = {"python_env": f"fresh venv (Python {RUN_PYTHON}) first on PATH, user site hidden",
                    "tmpdir": "per-run TMPDIR; new /tmp entries the agent named are moved into the run dir",
-                   "tooluniverse": f"{TOOLUNIVERSE_VERSION}, compose-tool registry fix "
-                                   "(evaluator/tooluniverse_server.py)"}
+                   "tooluniverse": f"{TOOLUNIVERSE_VERSION} (Python {TOOLUNIVERSE_PYTHON}, with "
+                                   f"{', '.join(EXTRA_PACKAGES)})"}
     if harness == "claude":
         home, task_file, mcp_file = hdir / "claude-home", hdir / "agent_task.md", hdir / "mcp.json"
         servers = _mcp_servers(repo_root, run_dir, environ, trust=False)

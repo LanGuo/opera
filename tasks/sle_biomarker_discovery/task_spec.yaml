@@ -3,8 +3,9 @@ goal: >
   Identify the top 3 cell-type-specific candidate biomarkers or therapeutic targets
   for systemic lupus erythematosus (SLE / lupus), supported by multi-modal evidence.
   Starting data: Perez et al. 2022 SLE PBMC cohort, accessible via the cellxgene_census
-  Python package (dataset ID: perez_2022, approximately 1.2 million cells, 162 donors —
-  SLE patients and healthy controls). The agent may discover and use additional datasets.
+  Python package (Census release 2025-11-08, dataset_id 218acb0f-9f2f-4f76-b90b-15a4b7c7f629;
+  1,263,676 cells from 261 donors: 162 SLE patients and 99 healthy controls). The agent may
+  discover and use additional datasets.
 hypothesis_attributes:
   - name: gene
     description: "HGNC symbol of the candidate biomarker or target"

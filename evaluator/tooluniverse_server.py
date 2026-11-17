@@ -1,62 +1,33 @@
-"""Run ToolUniverse's MCP stdio server with a fix for compose tools that unload every other tool.
+"""Run ToolUniverse's MCP stdio server at the pinned version.
 
 The matched profile starts it as
 
-  uvx --from tooluniverse==<TOOLUNIVERSE_VERSION> python -P evaluator/tooluniverse_server.py
+  uvx --python 3.12 --from tooluniverse==<TOOLUNIVERSE_VERSION> --with cellxgene-census \
+      python -P evaluator/tooluniverse_server.py
 
-The MCP server registers tool names longer than 45 characters in shortened form, but a
-ComposeTool checks its dependencies by full name. BiomarkerDiscoveryWorkflow, which the SLE task
-recommends, therefore finds two HPA tools "missing" on every call and auto-loads their category
-with load_tools(tool_type=[category]); that clears the registry by default, so the server keeps
-156 of 2,797 tools and execute_tool is gone for the rest of the run.
+1.5.8, used for the Tier 2 runs, needed a patch here: a compose tool such as
+BiomarkerDiscoveryWorkflow found its long-named dependencies "missing" and reloaded its category
+with the registry cleared, leaving 156 of 2,797 tools and no execute_tool. Our fix
+(mims-harvard/ToolUniverse#845) is in 1.5.9 and later, so the patch is gone (D-37).
 
-The wrapper below treats dependencies registered under a shortened name as present, and loads
-anything really missing without clearing the registry. Both of ComposeTool's other availability
-checks go through _load_missing_dependencies when a name misses, so this covers all three.
-Remove once the upstream fix is released (and TOOLUNIVERSE_VERSION moves past it).
+cellxgene-census goes into the same environment because ToolUniverse's CELLxGENE_* tools (expression
+data, cell and gene metadata) need it, and ToolUniverse only offers them when
+CELLXGENE_CENSUS_PACKAGE_INSTALLED=1 is set in its environment.
 """
-import functools
 import importlib.metadata
 import sys
 
-TOOLUNIVERSE_VERSION = "1.5.8"
-
-
-def patch_compose_tool():
-    from tooluniverse.compose_tool import ComposeTool
-
-    original = ComposeTool._load_missing_dependencies
-    if getattr(original, "_opera_patched", False):
-        return
-
-    @functools.wraps(original)
-    def load_missing_dependencies(self, missing_tools):
-        universe = self.tooluniverse
-        if universe is None:
-            return original(self, missing_tools)
-        registered = {name for name in missing_tools
-                      if universe._resolve_tool_name(name) in universe.all_tool_dict}
-        rest = set(missing_tools) - registered
-        if not rest:
-            return registered, set()
-        universe.load_tools = functools.partial(type(universe).load_tools, universe,
-                                                clear_existing=False)
-        try:
-            loaded, failed = original(self, rest)
-        finally:
-            del universe.load_tools
-        return registered | loaded, failed
-
-    load_missing_dependencies._opera_patched = True
-    ComposeTool._load_missing_dependencies = load_missing_dependencies
+TOOLUNIVERSE_VERSION = "1.5.10"
+EXTRA_PACKAGES = ("cellxgene-census",)
+# ToolUniverse hides its CELLxGENE_* tools unless this "key" is set; it means the package is installed.
+EXTRA_ENV = {"CELLXGENE_CENSUS_PACKAGE_INSTALLED": "1"}
+PYTHON = "3.12"  # tiledbsoma, under cellxgene-census, doesn't build on 3.14
 
 
 def main():
     installed = importlib.metadata.version("tooluniverse")
     if installed != TOOLUNIVERSE_VERSION:
-        sys.exit(f"tooluniverse {installed} is installed; this wrapper was checked against "
-                 f"{TOOLUNIVERSE_VERSION}")
-    patch_compose_tool()
+        sys.exit(f"tooluniverse {installed} is installed; OPERA pins {TOOLUNIVERSE_VERSION}")
     from tooluniverse.smcp_server import run_default_stdio_server
     run_default_stdio_server()
 

@@ -7,9 +7,11 @@ Identify the **top 3 cell-type-specific candidate biomarkers or therapeutic targ
 for systemic lupus erythematosus (SLE / lupus), supported by multi-modal evidence.
 
 **Starting data:** Perez et al. 2022 SLE PBMC cohort
-- CZI CellxGene Census: `homo_sapiens` collection, dataset ID `perez_2022`
-- ~1.2 million cells, 162 donors (SLE patients and healthy controls)
-- Access via: `cellxgene_census` Python package (query programmatically — do not bulk download)
+- CZI CellxGene Census, release `2025-11-08`: `homo_sapiens`, `dataset_id`
+  `218acb0f-9f2f-4f76-b90b-15a4b7c7f629` (DOI 10.1126/science.abf1970)
+- 1,263,676 cells from 261 donors: 162 SLE patients and 99 healthy controls
+- Access via: `cellxgene_census` Python package, `open_soma(census_version="2025-11-08")`
+  (query programmatically — do not bulk download)
 
 ## Required Behavior
 
