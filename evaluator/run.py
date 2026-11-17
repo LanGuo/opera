@@ -117,6 +117,15 @@ def _run_cli(plan: HarnessPlan, env: dict, out, err, timeout_s: float | None,
     return proc.wait(), (stopped[0] if stopped else None)
 
 
+def gemini_auth_from_google_key(harness: str, env: dict) -> None:
+    """Gemini CLI reads GEMINI_API_KEY; let a GOOGLE_API_KEY-only setup (our .env) work too.
+
+    Done here rather than in plan.env so the key never lands in the run_info entry.
+    """
+    if harness == "gemini" and not env.get("GEMINI_API_KEY") and env.get("GOOGLE_API_KEY"):
+        env["GEMINI_API_KEY"] = env["GOOGLE_API_KEY"]
+
+
 def _tmp_entries(tmp: Path) -> set[str]:
     try:
         return set(os.listdir(tmp))
@@ -174,6 +183,7 @@ def execute(plan: HarnessPlan, *, task_dir, cli_version: str | None, environ: di
 
     env = {k: v for k, v in (os.environ if environ is None else environ).items() if k not in plan.unset_env}
     env.update(plan.env)
+    gemini_auth_from_google_key(plan.harness, env)
     tmp_before = _tmp_entries(SHARED_TMP) if plan.sweep_tmp else set()
     with open(plan.run_dir / "transcript.jsonl", "w", encoding="utf-8") as out, \
          open(plan.run_dir / "harness_stderr.log", "w", encoding="utf-8") as err:

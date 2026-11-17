@@ -184,7 +184,30 @@ class StreamParser:
             return []
         if output is not None and not isinstance(output, str):
             output = json.dumps(output, ensure_ascii=False)
+        if error is None and _reports_failure(output):
+            error = "tool returned an error status"
         return [dict(call, output=output, error=error, finished=finished, stream_key=f"call:{cli_id}")]
+
+
+def _reports_failure(output) -> bool:
+    """True if a tool's output is a JSON object saying it failed.
+
+    ToolUniverse reports failures inside a normal result: {"status": "error", ...} or
+    {"success": false, ...}, sometimes wrapped as {"result": "<that JSON>"} by the MCP layer.
+    """
+    for _ in range(2):
+        if not isinstance(output, str) or not output.lstrip().startswith("{"):
+            return False
+        try:
+            obj = json.loads(output)
+        except ValueError:
+            return False
+        if not isinstance(obj, dict):
+            return False
+        if obj.get("status") == "error" or obj.get("success") is False:
+            return True
+        output = obj.get("result") if len(obj) == 1 else None
+    return False
 
 
 # --- The ledger ---------------------------------------------------------------------------------
@@ -408,7 +431,8 @@ def link_source(source: dict, calls: list[dict], finding: str = "") -> tuple[lis
                with no other signal, at least two must match).
     Returns (tool_call_ids, link, candidate ids, signals that matched). link is exact (one call
     left after at least one signal matched), probable (several left; the most recent is linked),
-    citation (no call matched, a citation given) or none.
+    citation (no call matched, a citation given) or none. Failed calls are dropped from the
+    candidates when a successful one is left.
     """
     source = source if isinstance(source, dict) else {}
     known = {c["tool_call_id"] for c in calls}
@@ -443,6 +467,9 @@ def link_source(source: dict, calls: list[dict], finding: str = "") -> tuple[lis
             candidates = [c for c in candidates if found(c) == best]
             signals.append("numbers")
     if signals and candidates:
+        # A call that failed produced no finding; keep it only if nothing else is left.
+        succeeded = [c for c in candidates if not c.get("error")]
+        candidates = succeeded or candidates
         ids = [c["tool_call_id"] for c in candidates]
         if len(ids) == 1:
             return ids, "exact", ids, signals

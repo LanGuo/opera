@@ -96,3 +96,15 @@ def test_no_hook_without_warning_or_in_pilot(tmp_path):
                      task_dir=tmp_path / "task", run_dir=tmp_path / "run2", repo_root=tmp_path,
                      environ={}, turn_warning=5)
     assert "Turn budget" not in pilot.task_text
+
+
+def test_gemini_key_mapped_from_google_key_only_for_gemini():
+    from evaluator.run import gemini_auth_from_google_key
+    env = {"GOOGLE_API_KEY": "g"}
+    gemini_auth_from_google_key("claude", env)
+    assert "GEMINI_API_KEY" not in env
+    gemini_auth_from_google_key("gemini", env)
+    assert env["GEMINI_API_KEY"] == "g"
+    env = {"GOOGLE_API_KEY": "g", "GEMINI_API_KEY": "own"}
+    gemini_auth_from_google_key("gemini", env)
+    assert env["GEMINI_API_KEY"] == "own"

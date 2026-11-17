@@ -110,7 +110,9 @@ def delivered_task_text(task_dir, turn_budget: tuple[int, int] | None = None) ->
 
 def _turn_budget_hooks(harness: str, repo_root: Path, cap: int, warn_at: int) -> dict:
     """CLI settings registering evaluator/turn_budget.py after every tool call."""
-    cmd = shlex.join(["uv", "run", "--project", str(repo_root), "python", "-m",
+    # The agent's shell sets VIRTUAL_ENV to the run's venv; unset it so uv doesn't warn that it
+    # differs from the project's on every tool call (Gemini CLI shows hook stderr).
+    cmd = shlex.join(["env", "-u", "VIRTUAL_ENV", "uv", "run", "--project", str(repo_root), "python", "-m",
                       "evaluator.turn_budget", "--harness", harness, "--cap", str(cap),
                       "--warn-at", str(warn_at)])
     matcher = "*" if harness == "claude" else ".*"

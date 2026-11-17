@@ -102,6 +102,20 @@ def test_gemini_stream_joins_text_and_keeps_error_type(tmp_path):
     assert c2["error_type"] == "tool_not_registered"
 
 
+def test_tool_failures_reported_inside_the_output_are_errors(tmp_path):
+    t = tmp_path / "transcript.jsonl"
+    outs = ['{"status": "error", "error": "research_topic is required"}',
+            '{"success": false, "error": "summary unavailable"}',
+            '{"result": "{\\"status\\": \\"error\\"}"}',
+            '{"status": "success", "data": {"success": false}}',
+            'status error in plain text']
+    for i, out in enumerate(outs):
+        _w(t, claude_call(f"t{i}", "mcp__tooluniverse__execute_tool", {"tool_name": "X"}, out))
+    led = Ledger(tmp_path)
+    led.sync_stream()
+    assert [bool(c["error"]) for c in led.entries("tool_call")] == [True, True, True, False, False]
+
+
 def test_partial_last_line_waits_and_unfinished_call_recorded_at_end(tmp_path):
     t = tmp_path / "transcript.jsonl"
     _w(t, claude_call("t1", "Bash", {"command": "ls"}, "x")[:1])
@@ -258,6 +272,15 @@ def test_link_source():
     assert link_source({"citation": "PMID 1"}, calls)[:2] == ([], "citation")
     assert link_source({"tool": "nothing"}, calls)[:2] == ([], "none")
     assert link_source({}, calls)[:2] == ([], "none")
+
+
+def test_link_drops_failed_calls_when_a_successful_one_is_left():
+    calls = [{"tool_call_id": "T1", "tool": "execute_tool", "cli_tool": "mcp__tooluniverse__execute_tool",
+              "arguments": {"name": "Workflow"}, "error": "tool reported an error"},
+             {"tool_call_id": "T2", "tool": "Workflow", "via": "execute_tool",
+              "arguments": {"tool_name": "Workflow"}}]
+    assert link_source({"tool": "execute_tool", "match": "Workflow"}, calls)[:3] == (["T2"], "exact", ["T2"])
+    assert link_source({"tool": "execute_tool", "match": "Workflow"}, calls[:1])[:2] == (["T1"], "exact")
 
 
 def test_unlinked_evidence_warns_the_agent(run):
