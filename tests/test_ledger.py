@@ -253,7 +253,7 @@ def test_link_source():
     assert link_source({"tool": "Bash"}, calls)[:2] == (["T3"], "probable")
     assert link_source({"tool": "OT_x"}, calls)[:2] == (["T2"], "exact")
     assert link_source({"tool": "execute_tool", "match": "gzmh"}, calls)[:2] == (["T2"], "exact")
-    assert link_source({"tool": "cellxgene", "match": "a.py"}, calls)[:2] == (["T1"], "probable")
+    assert link_source({"tool": "cellxgene", "match": "a.py"}, calls)[:2] == (["T1"], "exact")
     assert link_source({"tool_call_ids": ["T3"]}, calls)[:2] == (["T3"], "exact")
     assert link_source({"citation": "PMID 1"}, calls)[:2] == ([], "citation")
     assert link_source({"tool": "nothing"}, calls)[:2] == ([], "none")
@@ -395,3 +395,35 @@ def test_convert_v1_run(tmp_path):
     assert not (old / "ledger.jsonl").exists()     # the old run is left alone
     h = Workspace(out).read_ledger()["hypotheses"]["H1"]
     assert {e["evidence_id"] for e in h["evidence"]} == {"E1", "E2"}   # dropped item kept cited
+
+
+def test_link_uses_words_of_match_and_rounded_numbers():
+    calls = [
+        {"tool_call_id": "T1", "tool": "Bash", "cli_tool": "Bash",
+         "arguments": {"command": "cat > /tmp/deg.py << EOF\nDATASET_ID = \"218acb0f-9f2f\"\nEOF"},
+         "output": "IFI44L 2.871843 4.7e-14\nDNASE1L3 -0.116963 1.366398e-01"},
+        {"tool_call_id": "T2", "tool": "Bash", "cli_tool": "Bash",
+         "arguments": {"command": "cat > /tmp/pseudobulk.py"}, "output": "IFI44L 1.0 0.5"},
+        {"tool_call_id": "T3", "tool": "EWAS_x", "cli_tool": "mcp__tooluniverse__execute_tool",
+         "via": "execute_tool", "arguments": {"tool_name": "EWAS_x", "arguments": {"gene_symbol": "IFI44L"}},
+         "output": "rank 1"},
+    ]
+    # agent names a library, not the tool; words of match + rounded numbers find the call
+    ids, link, _, signals = link_source({"tool": "cellxgene_census.get_anndata", "match": "dataset_id=218acb0f"},
+                                        calls, "DNASE1L3 log2FC=-0.117, p=0.137")
+    assert (ids, link) == (["T1"], "exact") and signals == ["match", "numbers"]
+    # 'key=value' written by the agent vs JSON arguments
+    assert link_source({"tool": "EWAS_x", "match": "gene_symbol=IFI44L"}, calls)[:2] == (["T3"], "exact")
+    # numbers alone, among all calls
+    assert link_source({}, calls, "log2FC 2.87, p=4.7e-14")[:2] == (["T1"], "exact")
+    assert link_source({}, calls, "log2FC 2.87, p = 4.7×10⁻¹⁴")[:2] == (["T1"], "exact")
+    # a single number that appears nowhere links nothing
+    assert link_source({}, calls, "fold change 9.99")[:2] == ([], "none")
+
+
+def test_evidence_entry_records_link_signals(run):
+    _w(run / "transcript.jsonl", claude_call("t1", "Bash", {"command": "python deg.py"}, "lfc 2.1043 p 0.0312"))
+    call(server._tool_write_hypothesis, "h", {"gene": "X", "cell_type": "B"}, 0.5,
+         [ev("lfc 2.10, p 0.031", tool="Bash", match="deg.py")], "r")
+    item = Ledger(run).entries("hypothesis")[0]["evidence"][0]
+    assert item["link"] == "exact" and item["link_signals"] == ["tool", "match", "numbers"]

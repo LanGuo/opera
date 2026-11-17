@@ -133,9 +133,10 @@ def _evidence(items, hypothesis_id: str, ledger: Ledger, ids, prior: set[str]) -
         if not isinstance(finding, str) or not finding.strip():
             raise LedgerError(f"evidence item {n}: 'finding' (a factual statement of the result) is required")
         source = item.get("source") if isinstance(item.get("source"), dict) else {}
-        tool_call_ids, link, candidates = link_source(source, calls)
+        tool_call_ids, link, candidates, signals = link_source(source, calls, finding)
         new = {"evidence_id": ids.next("E"), "finding": finding.strip(), "source": source,
-               "relation": relation, "tool_call_ids": tool_call_ids, "link": link}
+               "relation": relation, "tool_call_ids": tool_call_ids, "link": link,
+               "link_signals": signals}
         if link == "probable":
             new["link_candidates"] = candidates
         q = item.get("quantities")
@@ -147,8 +148,10 @@ def _evidence(items, hypothesis_id: str, ledger: Ledger, ids, prior: set[str]) -
             new["extra"] = extra
         if link == "none":
             warnings.append(f"{new['evidence_id']}: no recorded source — no tool call matched "
-                            f"source={json.dumps(source)}; it will be shown to reviewers as "
-                            "'no recorded source'")
+                            f"source={json.dumps(source)}. Name the tool you called (e.g. Bash) and a "
+                            "short text from its arguments (e.g. the script name), or cite "
+                            "{\"tool_call_ids\": [...]} from recent_tool_calls. Until then it is "
+                            "shown to reviewers as 'no recorded source'")
         out.append(new)
     return out, warnings
 
@@ -344,7 +347,9 @@ def write_hypothesis(hypothesis: str, attributes: dict, confidence: float, evide
     confidence: 0-1.
     evidence: at least one item. A new item is {"finding": factual statement of what a result shows
       (numbers, not interpretation), "source": {"tool": name of the tool you called, "match": short
-      text from that call's arguments} or {"citation": "PMID ..."}, "relation": "supports" |
+      text from that call's arguments, e.g. a script name} or {"citation": "PMID ..."}. Name the tool
+      you called (Bash, run_shell_command, a ToolUniverse tool), not a library used in your code.
+      "relation": "supports" |
       "contradicts" | "context", "quantities": optional [{"name","value","unit"}]}. An earlier item
       is {"ref": "E3", "relation": ...}.
     rationale: why your confidence is what it is, given this evidence.

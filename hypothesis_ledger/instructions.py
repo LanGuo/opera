@@ -24,8 +24,10 @@ tool calls the harness records automatically (every tool you call and its full o
   hypothesis with `derived_from` set to the old id, and mark the old one `abandoned`.
 - **Evidence items** state facts: `finding` is what the result shows, with numbers (not why it
   matters; that goes in `rationale`). `source` names the tool call it came from:
-  `{"tool": "<tool name as you called it>", "match": "<short text from that call's arguments>"}`,
-  or `{"citation": "PMID ..."}` for literature. Reuse earlier evidence with `{"ref": "E3"}`.
+  `{"tool": "<the tool you called>", "match": "<short text from that call's arguments>"}`.
+  The tool is what you invoked (e.g. `Bash`, `run_shell_command`, or a ToolUniverse tool name),
+  not a library used inside your code; for code you ran, `match` can be the script's file name.
+  Use `{"citation": "PMID ..."}` for literature. Reuse earlier evidence with `{"ref": "E3"}`.
   Every item has `"relation"`: `supports`, `contradicts` or `context`.
 - **`log_note`** for interpretations (link them to hypotheses), plans and debugging.
 - **`declare_done`** to finish: your final hypotheses ranked best first, a rationale, a confidence

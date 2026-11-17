@@ -347,40 +347,105 @@ def task_rules_from_spec(spec: dict) -> dict:
 
 # --- Linking evidence to tool calls (at write time) ---------------------------------------------
 
-def link_source(source: dict, calls: list[dict]) -> tuple[list[str], str, list[str]]:
-    """Find the recorded tool calls an evidence item's `source` names.
+_WORD = re.compile(r"[A-Za-z0-9_.\-]+")       # keeps 'deg.py', 'gene_symbol', '218acb0f-9f2f'
+_PART = re.compile(r"[A-Za-z0-9]+")            # and their parts: 'deg', 'py', '218acb0f'
+_SCI = r"(?:\s*[eE]\s*[-+]?\d+|\s*[x×]\s*10\s*\^?\s*[-+−⁻]?[0-9⁰¹²³⁴⁵⁶⁷⁸⁹]+)?"
+_NUMBER = re.compile(r"-?\d+\.\d+" + _SCI)
+_OUTPUT_NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
+_SUPERSCRIPT = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹⁻−", "0123456789--")
+MATCH_MIN_SHARE = 0.5   # share of the words in source.match that must appear in a call's arguments
 
-    Returns (tool_call_ids, link, candidate ids). link is exact (one call matched), probable
-    (several matched; the most recent is linked), citation (no tool, a citation given) or none.
+
+def _words(text: str) -> set[str]:
+    return {w.strip(".-").lower() for w in _WORD.findall(text or "") if len(w.strip(".-")) > 1}
+
+
+def _all_words(text: str) -> set[str]:
+    return _words(text) | {p.lower() for p in _PART.findall(text or "") if len(p) > 1}
+
+
+def _parse_number(text: str) -> tuple[float, float]:
+    """('6.3×10⁻¹⁰') -> (6.3e-10, half a unit in the last written place)."""
+    t = text.translate(_SUPERSCRIPT).replace(" ", "")
+    m = re.match(r"(-?\d+\.(\d+))(?:[eE]([-+]?\d+)|[x×]10\^?([-+]?\d+))?$", t)
+    if not m:
+        return float("nan"), 0.0
+    exp = int(m.group(3) or m.group(4) or 0)
+    places = len(m.group(2))
+    return float(m.group(1)) * 10 ** exp, 0.5 * 10 ** (exp - places)
+
+
+_numbers_cache: dict[tuple, set[float]] = {}
+
+
+def _output_numbers(call: dict) -> set[float]:
+    key = (call.get("entry_id"), call.get("tool_call_id"), len(call.get("output") or ""))
+    if key not in _numbers_cache:
+        nums = set()
+        for t in _OUTPUT_NUMBER.findall(call.get("output") or ""):
+            try:
+                nums.add(float(t))
+            except ValueError:
+                pass
+        _numbers_cache[key] = nums
+    return _numbers_cache[key]
+
+
+def _rounds_to(text: str, shown: set[float]) -> bool:
+    """A number as the agent wrote it ('-0.117', '6.3e-10') matches an output value that rounds to it."""
+    target, tol = _parse_number(text)
+    return tol > 0 and any(abs(x - target) <= tol * (1 + 1e-9) for x in shown)
+
+
+def link_source(source: dict, calls: list[dict], finding: str = "") -> tuple[list[str], str, list[str], list[str]]:
+    """Find the recorded tool calls an evidence item came from.
+
+    Signals, applied in turn to narrow the candidates:
+      tool     the call's tool name equals source.tool;
+      match    most words of source.match appear in the call's arguments;
+      numbers  the finding's decimal numbers appear in the call's output (the most of them wins).
+    Returns (tool_call_ids, link, candidate ids, signals that matched). link is exact (one call
+    left after at least one signal matched), probable (several left; the most recent is linked),
+    citation (no call matched, a citation given) or none.
     """
     source = source if isinstance(source, dict) else {}
-    named_ids = [i for i in source.get("tool_call_ids") or [] if isinstance(i, str)]
     known = {c["tool_call_id"] for c in calls}
+    named_ids = [i for i in source.get("tool_call_ids") or [] if i in known]
     if named_ids:
-        good = [i for i in named_ids if i in known]
-        if good:
-            return good, "exact", good
+        return named_ids, "exact", named_ids, ["tool_call_ids"]
+
+    candidates, signals = list(calls), []
     tool = str(source.get("tool") or "").strip().lower()
-    match = str(source.get("match") or "").strip().lower()
-    if tool or match:
-        def tool_ok(c):
-            names = {str(c.get(k) or "").lower() for k in ("tool", "cli_tool", "via")}
-            return not tool or tool in names
-        def match_ok(c):
-            return not match or match in json.dumps(c.get("arguments"), ensure_ascii=False).lower()
-        found = [c["tool_call_id"] for c in calls if tool_ok(c) and match_ok(c)]
-        if not found and tool and match:
-            # The agent may name the tool loosely; the argument text is the stronger signal.
-            found = [c["tool_call_id"] for c in calls if match_ok(c)]
-            if found:
-                return [found[-1]], "probable", found
-        if len(found) == 1:
-            return found, "exact", found
-        if found:
-            return [found[-1]], "probable", found
+    if tool:
+        by_name = [c for c in candidates
+                   if tool in {str(c.get(k) or "").lower() for k in ("tool", "cli_tool", "via")}]
+        if by_name:
+            candidates, signals = by_name, signals + ["tool"]
+    words = _words(str(source.get("match") or ""))
+    if words:
+        def share(c):
+            return len(words & _all_words(json.dumps(c.get("arguments"), ensure_ascii=False))) / len(words)
+        best = max((share(c) for c in candidates), default=0)
+        if best >= MATCH_MIN_SHARE:
+            candidates = [c for c in candidates if share(c) == best]
+            signals.append("match")
+    numbers = set(_NUMBER.findall(finding or ""))
+    if numbers:
+        def found(c):
+            shown = _output_numbers(c)
+            return sum(1 for n in numbers if _rounds_to(n, shown))
+        best = max((found(c) for c in candidates), default=0)
+        if best >= min(2, len(numbers)):
+            candidates = [c for c in candidates if found(c) == best]
+            signals.append("numbers")
+    if signals and candidates:
+        ids = [c["tool_call_id"] for c in candidates]
+        if len(ids) == 1:
+            return ids, "exact", ids, signals
+        return [ids[-1]], "probable", ids, signals
     if source.get("citation"):
-        return [], "citation", []
-    return [], "none", []
+        return [], "citation", [], []
+    return [], "none", [], []
 
 
 # --- Workspace files at the end of a run --------------------------------------------------------
