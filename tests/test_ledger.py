@@ -419,6 +419,10 @@ def test_link_uses_words_of_match_and_rounded_numbers():
     assert link_source({}, calls, "log2FC 2.87, p = 4.7×10⁻¹⁴")[:2] == (["T1"], "exact")
     # a single number that appears nowhere links nothing
     assert link_source({}, calls, "fold change 9.99")[:2] == ([], "none")
+    # with no other signal, one matching number is not enough (shake-down run 2, E19)
+    assert link_source({"citation": "PMID 1"}, calls, "log2FC=2.87 in a paper")[:2] == ([], "citation")
+    # but it narrows candidates once the tool matched
+    assert link_source({"tool": "Bash"}, calls, "log2FC=2.87")[:2] == (["T1"], "exact")
 
 
 def test_evidence_entry_records_link_signals(run):

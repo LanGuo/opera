@@ -403,7 +403,8 @@ def link_source(source: dict, calls: list[dict], finding: str = "") -> tuple[lis
     Signals, applied in turn to narrow the candidates:
       tool     the call's tool name equals source.tool;
       match    most words of source.match appear in the call's arguments;
-      numbers  the finding's decimal numbers appear in the call's output (the most of them wins).
+      numbers  the finding's decimal numbers appear in the call's output (the most of them wins;
+               with no other signal, at least two must match).
     Returns (tool_call_ids, link, candidate ids, signals that matched). link is exact (one call
     left after at least one signal matched), probable (several left; the most recent is linked),
     citation (no call matched, a citation given) or none.
@@ -435,7 +436,9 @@ def link_source(source: dict, calls: list[dict], finding: str = "") -> tuple[lis
             shown = _output_numbers(c)
             return sum(1 for n in numbers if _rounds_to(n, shown))
         best = max((found(c) for c in candidates), default=0)
-        if best >= min(2, len(numbers)):
+        # Alone, numbers must match at least two values: one common value (e.g. -0.50) is
+        # too easily found in an unrelated output.
+        if best >= (min(2, len(numbers)) if signals else 2):
             candidates = [c for c in candidates if found(c) == best]
             signals.append("numbers")
     if signals and candidates:
