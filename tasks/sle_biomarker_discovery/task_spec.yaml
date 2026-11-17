@@ -5,6 +5,14 @@ goal: >
   Starting data: Perez et al. 2022 SLE PBMC cohort, accessible via the cellxgene_census
   Python package (dataset ID: perez_2022, approximately 1.2 million cells, 162 donors —
   SLE patients and healthy controls). The agent may discover and use additional datasets.
+hypothesis_attributes:
+  - name: gene
+    description: "HGNC symbol of the candidate biomarker or target"
+  - name: cell_type
+    description: "the cell type(s) the hypothesis is about"
+hypothesis_constraints:
+  - unique: [gene]
+    among: [active, supported, weakened]
 termination_criteria:
   min_hypotheses_with_multimodal_evidence: 3
   max_tool_calls: 200

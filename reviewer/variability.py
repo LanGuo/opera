@@ -27,6 +27,8 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 
+from hypothesis_ledger.workspace import Workspace
+
 from reviewer.falsification import assess_terminal_hypotheses
 from reviewer.llm import DEFAULT_MODELS, LLMClient
 from reviewer.prompt_variants import VARIANTS, get_variant
@@ -173,8 +175,8 @@ def run_repeats(
     # The observer returns an empty result for a missing ledger rather than failing,
     # so a bad path would otherwise be recorded as a successful, empty unit.
     for run_dir in run_dirs:
-        if not (Path(run_dir) / "ledger.json").is_file():
-            raise FileNotFoundError(f"not a run directory (no ledger.json): {run_dir}")
+        if not Workspace(run_dir).is_run():
+            raise FileNotFoundError(f"not a run directory (no ledger.jsonl or ledger.json): {run_dir}")
     get_variant(prompt_variant)  # fail before any call on an unknown name
     arm = arm or _arm_name(temperature, prompt_variant)
     done = {_key(r) for r in load_records(out_path) if r.get("ok")}

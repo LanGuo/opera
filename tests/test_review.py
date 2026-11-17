@@ -4,7 +4,7 @@ import csv
 import json
 import pytest
 from pathlib import Path
-from hypothesis_ledger.workspace import Workspace
+from tests.v1_run import V1Workspace as Workspace
 from reviewer.review import build_review_data, _render_file, _collect_supporting_files, DEFAULT_RUBRIC
 
 
@@ -88,7 +88,7 @@ def test_collect_supporting_files_empty(tmp_path):
 
 
 def test_collect_supporting_files_finds_csv(run_with_data):
-    from hypothesis_ledger.workspace import Workspace as WS
+    from tests.v1_run import V1Workspace as WS
     ws = WS(run_with_data)
     files = _collect_supporting_files(ws.run_dir)
     assert len(files) == 1

@@ -3,7 +3,7 @@ updates kept, weakened/refuted hypotheses scored, run metrics over all hypothese
 overall prompt listing the hypotheses."""
 import yaml
 
-from hypothesis_ledger.workspace import Workspace
+from tests.v1_run import V1Workspace as Workspace
 from reviewer.evidence import all_evidence, evidence_parts, format_evidence_list
 from reviewer.falsification import assess_hypothesis
 from reviewer.llm import MockLLMClient

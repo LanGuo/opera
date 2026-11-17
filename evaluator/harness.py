@@ -25,7 +25,11 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import yaml
+
 from evaluator.tooluniverse_server import TOOLUNIVERSE_VERSION
+from hypothesis_ledger.instructions import ledger_instructions
+from hypothesis_ledger.ledger import task_rules_from_spec
 from reviewer.log_replay import gemini_response_count
 
 PROFILES = ("pilot", "matched")
@@ -62,6 +66,8 @@ class HarnessPlan:
     stop_on_result: bool = False
     venv: Path | None = None   # created with RUN_PYTHON before the run; first on the agent's PATH
     sweep_tmp: bool = False    # move files the agent left in the shared /tmp into the run dir
+    task_text: str = ""        # the prompt as delivered: agent_task.md + the ledger section
+    task_rules: dict = field(default_factory=dict)  # hypothesis attributes and constraints
 
 
 def harness_for(model: str) -> str:
@@ -84,6 +90,15 @@ def _mcp_servers(repo_root: Path, run_dir: Path, environ: dict, trust: bool) -> 
     return {"hypothesis-ledger": ledger, "tooluniverse": tools}
 
 
+def delivered_task_text(task_dir) -> str:
+    """agent_task.md followed by the ledger section generated from the task spec."""
+    task_dir = Path(task_dir)
+    spec = task_dir / "task_spec.yaml"
+    spec_data = yaml.safe_load(spec.read_text(encoding="utf-8")) if spec.exists() else {}
+    text = (task_dir / "agent_task.md").read_text(encoding="utf-8").rstrip("\n")
+    return f"{text}\n\n{ledger_instructions(spec_data)}"
+
+
 def plan_run(
     *, profile: str, model: str, max_turns: int, task_dir, run_dir, repo_root, environ: dict,
     gemini_max_session_turns: int | None = None,
@@ -91,11 +106,13 @@ def plan_run(
     if profile not in PROFILES:
         raise ValueError(f"unknown profile {profile!r}; choose from {PROFILES}")
     task_dir, run_dir, repo_root = Path(task_dir), Path(run_dir), Path(repo_root)
-    task_text = (task_dir / "agent_task.md").read_text(encoding="utf-8")
     spec = task_dir / "task_spec.yaml"
+    spec_data = yaml.safe_load(spec.read_text(encoding="utf-8")) if spec.exists() else {}
+    task_text = delivered_task_text(task_dir)
     spec_copy = {spec: run_dir / "task_spec.yaml"} if spec.exists() else {}
     harness = harness_for(model)
-    base = dict(profile=profile, harness=harness, model=model, run_dir=run_dir)
+    base = dict(profile=profile, harness=harness, model=model, run_dir=run_dir, task_text=task_text,
+                task_rules=task_rules_from_spec(spec_data or {}))
 
     if profile == "pilot":
         task_bash = task_text.rstrip("\n")  # $(cat file) strips trailing newlines

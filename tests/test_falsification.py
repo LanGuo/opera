@@ -178,7 +178,7 @@ def test_assess_hypothesis_does_not_override_observer_confidence_when_flagged():
 
 def test_assess_terminal_hypotheses_includes_active_with_evidence(tmp_path):
     """Observer runs on terminal and active hypotheses; refuted and evidence-less are excluded."""
-    from hypothesis_ledger.workspace import Workspace
+    from tests.v1_run import V1Workspace as Workspace
     ws = Workspace(str(tmp_path / "run_001"))
     def add(data):
         data["hypotheses"] = {
@@ -339,7 +339,7 @@ def test_assess_terminal_hypotheses_raises_without_backend(tmp_path, monkeypatch
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.delenv("OLLAMA_MODEL", raising=False)
-    from hypothesis_ledger.workspace import Workspace
+    from tests.v1_run import V1Workspace as Workspace
     Workspace(str(tmp_path / "run_001"))
     with pytest.raises(ValueError, match="ANTHROPIC_API_KEY"):
         assess_terminal_hypotheses(str(tmp_path / "run_001"))

@@ -1,7 +1,7 @@
 import json
 import pytest
 from pathlib import Path
-from hypothesis_ledger.workspace import Workspace
+from tests.v1_run import V1Workspace as Workspace
 from reviewer.log_replay import (analyze_run, RunMetrics, _parse_transcript,
                                   _bare_tool_name, _confidence_sequence,
                                   _martingale_score, _directional_flip_count)

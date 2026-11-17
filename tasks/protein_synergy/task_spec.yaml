@@ -13,6 +13,11 @@ termination_criteria:
 evaluator:
   model: claude-opus-4-7
   max_turns: 200
+hypothesis_attributes:
+  - name: protein
+    description: "the protein whose fitness landscape the hypothesis is about"
+  - name: proposed_driver
+    description: "what drives synergy: active_site_proximity | physical_distance | other"
 rubric:
   - id: hypothesis_novelty
     label: "Hypothesis Novelty"

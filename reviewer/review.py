@@ -93,14 +93,7 @@ def build_review_data(run_dir: str, llm_scores=None) -> dict:
     metrics = analyze_run(run_dir)
     ledger = ws.read_ledger()
 
-    steps = []
-    if ws.step_log_path.exists():
-        for line in ws.step_log_path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                try:
-                    steps.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
+    steps = ws.read_step_log()
 
     hypotheses = sorted(
         ledger.get("hypotheses", {}).values(),
@@ -117,8 +110,8 @@ def build_review_data(run_dir: str, llm_scores=None) -> dict:
         "overall_raw_by_backend": None,
     }
     total_tool_calls = None
-    if ws.final_report_path.exists():
-        report = json.loads(ws.final_report_path.read_text(encoding="utf-8"))
+    report = ws.read_final_report()
+    if report is not None:
         locked["rationale"] = report.get("rationale")
         locked["confidence_summary"] = report.get("confidence_summary")
         locked["suggested_validation"] = report.get("suggested_validation")

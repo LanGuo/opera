@@ -30,6 +30,8 @@ EXTRACTION_SYSTEM = (
     '    "custom": []\n'
     "  },\n"
     '  "evaluator": {"model": "claude-opus-4-7", "max_turns": 250},\n'
+    '  "hypothesis_attributes": [{"name": "snake_case_name", "description": "what this field of a hypothesis holds"}],\n'
+    '  "hypothesis_constraints": [{"unique": ["attribute_name"], "among": ["active", "supported", "weakened"]}],\n'
     '  "rubric": [\n'
     '    {"id": "snake_case_id", "label": "Human-readable label", '
     '"scope": "per_hypothesis", "scale": "1-5", '
@@ -43,6 +45,9 @@ EXTRACTION_SYSTEM = (
     "2-3 overall items (run-level quality). "
     "scope must be 'per_hypothesis' or 'overall'. scale must be '1-5' or 'yes/no/partial'. "
     "guidance must be specific to this task, not generic. "
+    "hypothesis_attributes: the structured fields every hypothesis in this task names (e.g. a gene and a "
+    "cell type, or a protein and a proposed driver); [] if a hypothesis is just a sentence. "
+    "hypothesis_constraints: only rules the description implies, e.g. one hypothesis per gene; usually []. "
     "Suggest sensible defaults for missing fields."
 )
 
@@ -64,6 +69,8 @@ AGENT_TASK_SYSTEM = (
     "rendered as a Markdown checklist. "
     "The 'Success Criteria' section in agent_task.md must be consistent with the rubric items "
     "in the task spec — the rubric items formalize the same evaluation criteria in prose. "
+    "Do not describe the hypothesis-ledger tools (write_hypothesis, update_hypothesis, log_note, "
+    "declare_done): the harness appends a section with their rules, generated from the task spec. "
     "Return only the agent_task.md content, no JSON wrapper."
 )
 
@@ -92,6 +99,8 @@ class SaveRequest(BaseModel):
     evaluator: dict
     rubric_overrides: list | dict
     agent_task_md: str
+    hypothesis_attributes: list = []
+    hypothesis_constraints: list = []
 
 
 def _build_yaml(req: SaveRequest) -> str:
@@ -104,6 +113,18 @@ def _build_yaml(req: SaveRequest) -> str:
             lines.append(f"  {k}: {str(v).lower()}")
         else:
             lines.append(f"  {k}: {v}")
+    if req.hypothesis_attributes:
+        lines.append("hypothesis_attributes:")
+        for a in req.hypothesis_attributes:
+            lines.append(f"  - name: {str(a.get('name', '')).replace(' ', '_')}")
+            if a.get("description"):
+                lines.append(f"    description: {json.dumps(str(a['description']))}")
+    if req.hypothesis_constraints:
+        lines.append("hypothesis_constraints:")
+        for c in req.hypothesis_constraints:
+            lines.append(f"  - unique: {json.dumps(list(c.get('unique') or []))}")
+            if c.get("among"):
+                lines.append(f"    among: {json.dumps(list(c['among']))}")
     lines.append("evaluator:")
     lines.append(f"  model: {req.evaluator.get('model', 'claude-opus-4-7')}")
     lines.append(f"  max_turns: {req.evaluator.get('max_turns', 250)}")
@@ -251,7 +272,9 @@ function collectSpec() {
             model: document.getElementById('evaluator-model').value,
             max_turns: parseInt(document.getElementById('max-turns').value) || 250
         },
-        rubric_overrides: collectRubric()
+        rubric_overrides: collectRubric(),
+        hypothesis_attributes: window.hypothesisAttributes || [],
+        hypothesis_constraints: window.hypothesisConstraints || []
     };
 }
 
@@ -274,6 +297,8 @@ async function extractTask() {
             showError(data.error);
             return;
         }
+        window.hypothesisAttributes = data.hypothesis_attributes || [];
+        window.hypothesisConstraints = data.hypothesis_constraints || [];
         document.getElementById('task-id').value = data.task_id || '';
         document.getElementById('goal').value = data.goal || '';
         document.getElementById('min-hypotheses').value =

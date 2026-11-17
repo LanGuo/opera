@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import patch
-from hypothesis_ledger.workspace import Workspace
+from tests.v1_run import V1Workspace as Workspace
 from reviewer.llm import MockLLMClient
 from reviewer.score import (
     score_run, score_run_all_backends, RunScores, _parse_json_criteria,
