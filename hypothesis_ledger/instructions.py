@@ -35,9 +35,15 @@ tool calls the harness records automatically (every tool you call and its full o
 """
 
 
-def ledger_instructions(spec: dict | None) -> str:
+def ledger_instructions(spec: dict | None, turn_budget: tuple[int, int] | None = None) -> str:
+    """The ledger section for a task. turn_budget (cap, warn_at) adds the run's turn cap."""
     rules = task_rules_from_spec(spec or {})
     lines = [_BASE]
+    if turn_budget:
+        cap, warn_at = turn_budget
+        lines.append(f"**Turn budget:** this run stops after {cap} turns; each of your responses "
+                     f"uses one. From {warn_at} turns before the end, tool results tell you how "
+                     "many are left. Leave yourself a turn to call `declare_done`.\n")
     attrs = rules["hypothesis_attributes"]
     if attrs:
         lines.append("**This task's hypothesis attributes** (pass them in `attributes`):\n")

@@ -4,7 +4,8 @@ Every entry has `entry_id`, `time`, `kind` and `written_by`. Kinds:
 
 - written by the harness: `run_info` (start and end of the run), `tool_call` (every tool the agent
   used, with its full output), `agent_message` (text and thinking blocks), `artifact` (workspace
-  files at the end of the run);
+  files at the end of the run), `harness_message` (anything the harness told the agent during
+  the run, such as the turn-budget notice);
 - written by the agent through the ledger tools: `hypothesis`, `note`, `human_input`,
   `conclusion`.
 

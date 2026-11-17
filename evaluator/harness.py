@@ -8,7 +8,9 @@ Two profiles:
   runs under --max-turns; Gemini gets the task as a user message with no turn cap.
 - "matched" runs each CLI as a fresh install would: an empty config home per CLI, a clean
   per-run working directory, only OPERA's two MCP servers, the task appended to each CLI's own
-  system prompt, the same "Begin the task." message, and a turn cap for both. Subagents are off
+  system prompt, the same "Begin the task." message, and a turn cap for both. With
+  --turn-warning N, both CLIs run evaluator/turn_budget.py after every tool call, which tells the
+  agent how many turns are left once N or fewer remain. Subagents are off
   in both CLIs, and so are Claude Code's background tasks, which can wake the agent after the
   cap and keep `claude -p` running. Each run gets its own Python environment and temp directory,
   so packages and files one agent leaves behind don't reach the next. The task spec, which holds
@@ -20,6 +22,7 @@ reported, which can differ from the model requested.
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -28,6 +31,7 @@ from pathlib import Path
 import yaml
 
 from evaluator.tooluniverse_server import TOOLUNIVERSE_VERSION
+from evaluator.turn_budget import HOOK_EVENTS
 from hypothesis_ledger.instructions import ledger_instructions
 from hypothesis_ledger.ledger import task_rules_from_spec
 from reviewer.log_replay import gemini_response_count
@@ -90,27 +94,46 @@ def _mcp_servers(repo_root: Path, run_dir: Path, environ: dict, trust: bool) -> 
     return {"hypothesis-ledger": ledger, "tooluniverse": tools}
 
 
-def delivered_task_text(task_dir) -> str:
-    """agent_task.md followed by the ledger section generated from the task spec."""
+def delivered_task_text(task_dir, turn_budget: tuple[int, int] | None = None) -> str:
+    """agent_task.md followed by the ledger section generated from the task spec.
+
+    turn_budget (cap, warn_at) adds a line telling the agent its turn cap and when it is warned.
+    """
     task_dir = Path(task_dir)
     spec = task_dir / "task_spec.yaml"
     spec_data = yaml.safe_load(spec.read_text(encoding="utf-8")) if spec.exists() else {}
     text = (task_dir / "agent_task.md").read_text(encoding="utf-8").rstrip("\n")
-    return f"{text}\n\n{ledger_instructions(spec_data)}"
+    return f"{text}\n\n{ledger_instructions(spec_data, turn_budget=turn_budget)}"
+
+
+def _turn_budget_hooks(harness: str, repo_root: Path, cap: int, warn_at: int) -> dict:
+    """CLI settings registering evaluator/turn_budget.py after every tool call."""
+    cmd = shlex.join(["uv", "run", "--project", str(repo_root), "python", "-m",
+                      "evaluator.turn_budget", "--harness", harness, "--cap", str(cap),
+                      "--warn-at", str(warn_at)])
+    matcher = "*" if harness == "claude" else ".*"
+    return {"hooks": {HOOK_EVENTS[harness]: [{"matcher": matcher,
+                                              "hooks": [{"type": "command", "command": cmd}]}]}}
 
 
 def plan_run(
     *, profile: str, model: str, max_turns: int, task_dir, run_dir, repo_root, environ: dict,
-    gemini_max_session_turns: int | None = None,
+    gemini_max_session_turns: int | None = None, turn_warning: int = 0,
 ) -> HarnessPlan:
     if profile not in PROFILES:
         raise ValueError(f"unknown profile {profile!r}; choose from {PROFILES}")
     task_dir, run_dir, repo_root = Path(task_dir), Path(run_dir), Path(repo_root)
     spec = task_dir / "task_spec.yaml"
     spec_data = yaml.safe_load(spec.read_text(encoding="utf-8")) if spec.exists() else {}
-    task_text = delivered_task_text(task_dir)
     spec_copy = {spec: run_dir / "task_spec.yaml"} if spec.exists() else {}
     harness = harness_for(model)
+    # The pilot runs had no turn-budget warning; matched runs get one when turn_warning > 0.
+    cap = max_turns if harness == "claude" else (gemini_max_session_turns or max_turns)
+    warn = turn_warning if profile == "matched" and turn_warning > 0 else 0
+    task_text = delivered_task_text(task_dir, turn_budget=(cap, warn) if warn else None)
+    hooks = _turn_budget_hooks(harness, repo_root, cap, warn) if warn else {}
+    warning_detail = (f"from {warn} turns before the cap, a hook adds the turns left to each tool "
+                      "result (evaluator/turn_budget.py)") if warn else "none"
     base = dict(profile=profile, harness=harness, model=model, run_dir=run_dir, task_text=task_text,
                 task_rules=task_rules_from_spec(spec_data or {}))
 
@@ -164,18 +187,19 @@ def plan_run(
                  # Claude Code gives its shell TMPDIR=<this>/claude-<uid> (default base /tmp,
                  # shared by every Claude Code session on the machine).
                  "CLAUDE_CODE_TMPDIR": str(tmp)},
-            files={task_file: task_text, mcp_file: json.dumps({"mcpServers": servers}, indent=2)},
+            files={task_file: task_text, mcp_file: json.dumps({"mcpServers": servers}, indent=2),
+                   **({home / "settings.json": json.dumps(hooks, indent=2)} if hooks else {})},
             dirs=[ws, home, tmp], copy_after_run=spec_copy, stop_on_result=True, **isolation,
             details={"task_delivery": "appended to the CLI's built-in system prompt "
                                       "(--append-system-prompt-file)",
                      "turn_cap": f"--max-turns {max_turns}",
+                     "turn_warning": warning_detail,
                      "subagents": "off (--disallowedTools " + " ".join(CLAUDE_SUBAGENT_TOOLS) + ")",
                      "background_tasks": "off (CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1)",
                      **env_details,
                      "isolation": "empty CLAUDE_CONFIG_DIR, clean workspace, --strict-mcp-config"},
         )
 
-    cap = gemini_max_session_turns or max_turns
     home = hdir / "gemini-home"
     servers = _mcp_servers(repo_root, run_dir, environ, trust=True)
     # experimental.enableAgents only gates user-defined agents; the built-in ones stay reachable
@@ -183,7 +207,7 @@ def plan_run(
     # ToolUniverse saves large results under TMPDIR, outside the workspace, and Gemini CLI's file
     # tools refuse paths outside the workspace unless the directory is included (Claude's don't).
     settings = {"model": {"maxSessionTurns": cap}, "tools": {"exclude": [GEMINI_SUBAGENT_TOOL]},
-                "context": {"includeDirectories": [str(tmp)]}, "mcpServers": servers}
+                "context": {"includeDirectories": [str(tmp)]}, "mcpServers": servers, **hooks}
     argv = ["gemini", "-p", USER_PROMPT, "--model", model, "--output-format", "stream-json",
             "--approval-mode", "yolo", "--skip-trust"]
     return HarnessPlan(
@@ -195,6 +219,7 @@ def plan_run(
         dirs=[ws, home, tmp], copy_after_run=spec_copy, stop_on_result=True, **isolation,
         details={"task_delivery": "appended to the CLI's built-in system prompt (workspace GEMINI.md)",
                  "turn_cap": f"model.maxSessionTurns {cap}",
+                 "turn_warning": warning_detail,
                  "subagents": f"off (tools.exclude {GEMINI_SUBAGENT_TOOL})",
                  "background_tasks": "on (background shell processes don't wake the agent; "
                                      "maxSessionTurns is a hard stop)",

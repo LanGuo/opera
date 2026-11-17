@@ -219,6 +219,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--max-turns", type=int, default=30)
     parser.add_argument("--gemini-max-session-turns", type=int, default=None,
                         help="matched Gemini runs only; default: --max-turns")
+    parser.add_argument("--turn-warning", type=int, default=5,
+                        help="matched runs only: tell the agent the turns left once this many or "
+                             "fewer remain; 0 for none, as in the Tier 2 runs (default: 5)")
     parser.add_argument("--task", default="sle_biomarker_discovery")
     parser.add_argument("--runs-root", default=os.environ.get("WORKSPACE_ROOT", str(Path.home() / "bioeval")) + "/runs")
     parser.add_argument("--run-id", default=None)
@@ -235,7 +238,7 @@ def main(argv: list[str] | None = None) -> None:
     plan = plan_run(
         profile=args.profile, model=args.model, max_turns=args.max_turns, task_dir=task_dir,
         run_dir=Path(args.runs_root) / run_id, repo_root=REPO_ROOT, environ=dict(os.environ),
-        gemini_max_session_turns=args.gemini_max_session_turns,
+        gemini_max_session_turns=args.gemini_max_session_turns, turn_warning=args.turn_warning,
     )
     if args.dry_run:
         task_text = plan.task_text
