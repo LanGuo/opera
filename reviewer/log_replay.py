@@ -383,7 +383,10 @@ def analyze_run(run_dir: str) -> RunMetrics:
         end = ws.ledger.run_info("end") or {}
         cost_usd, unpriced = end.get("cost_usd"), end.get("cost_unpriced_models") or []
         outcome = end.get("outcome") or {}
-        turn_count = outcome.get("turns_total") or outcome.get("model_responses")
+        # Main-agent model responses: what both CLIs' turn caps count. Claude Code's num_turns
+        # (turns_total) is 31 for a run stopped at a cap of 30 but 47 for one that finished in 30
+        # responses, so it doesn't compare across runs.
+        turn_count = outcome.get("model_responses") or outcome.get("turns_total")
         universe_counts: dict[str, int] = {}
         for name, args in calls:
             tool = _universe_tool(name, args)

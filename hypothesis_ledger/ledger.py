@@ -189,11 +189,16 @@ class StreamParser:
         return [dict(call, output=output, error=error, finished=finished, stream_key=f"call:{cli_id}")]
 
 
+_ERROR_FIELDS = {"status", "success", "error", "error_details", "message", "details", "next_steps",
+                 "missing_tools", "retriable"}
+
+
 def _reports_failure(output) -> bool:
     """True if a tool's output is a JSON object saying it failed.
 
     ToolUniverse reports failures inside a normal result: {"status": "error", ...} or
     {"success": false, ...}, sometimes wrapped as {"result": "<that JSON>"} by the MCP layer.
+    Such an output with any other field (data) is a partial result, not a failure.
     """
     for _ in range(2):
         if not isinstance(output, str) or not output.lstrip().startswith("{"):
@@ -205,7 +210,9 @@ def _reports_failure(output) -> bool:
         if not isinstance(obj, dict):
             return False
         if obj.get("status") == "error" or obj.get("success") is False:
-            return True
+            # A partial result (e.g. LiteratureSearchTool's articles without its summary) still
+            # carries data; only an output with nothing but error fields is a failure.
+            return set(obj) <= _ERROR_FIELDS
         output = obj.get("result") if len(obj) == 1 else None
     return False
 
@@ -447,6 +454,7 @@ def link_source(source: dict, calls: list[dict], finding: str = "") -> tuple[lis
                    if tool in {str(c.get(k) or "").lower() for k in ("tool", "cli_tool", "via")}]
         if by_name:
             candidates, signals = by_name, signals + ["tool"]
+    by_tool = list(candidates)
     words = _words(str(source.get("match") or ""))
     if words:
         def share(c):
@@ -461,6 +469,14 @@ def link_source(source: dict, calls: list[dict], finding: str = "") -> tuple[lis
             shown = _output_numbers(c)
             return sum(1 for n in numbers if _rounds_to(n, shown))
         best = max((found(c) for c in candidates), default=0)
+        # The words of `match` can point at the wrong call: the agent names the script it wrote
+        # in one call and ran in another. If the calls the words kept show fewer than two of the
+        # finding's numbers and a call they ruled out shows at least two, the numbers win. (A
+        # finding that combines two calls' numbers keeps the call its words name.)
+        wide = max((found(c) for c in by_tool), default=0)
+        if "match" in signals and best < 2 <= wide:
+            candidates, best = by_tool, wide
+            signals.remove("match")
         # Alone, numbers must match at least two values: one common value (e.g. -0.50) is
         # too easily found in an unrelated output.
         if best >= (min(2, len(numbers)) if signals else 2):

@@ -108,12 +108,13 @@ def test_tool_failures_reported_inside_the_output_are_errors(tmp_path):
             '{"success": false, "error": "summary unavailable"}',
             '{"result": "{\\"status\\": \\"error\\"}"}',
             '{"status": "success", "data": {"success": false}}',
-            'status error in plain text']
+            'status error in plain text',
+            '{"success": false, "error": "no summary", "literature": {"articles": [1]}}']
     for i, out in enumerate(outs):
         _w(t, claude_call(f"t{i}", "mcp__tooluniverse__execute_tool", {"tool_name": "X"}, out))
     led = Ledger(tmp_path)
     led.sync_stream()
-    assert [bool(c["error"]) for c in led.entries("tool_call")] == [True, True, True, False, False]
+    assert [bool(c["error"]) for c in led.entries("tool_call")] == [True, True, True, False, False, False]
 
 
 def test_partial_last_line_waits_and_unfinished_call_recorded_at_end(tmp_path):
@@ -283,6 +284,24 @@ def test_link_drops_failed_calls_when_a_successful_one_is_left():
     assert link_source({"tool": "execute_tool", "match": "Workflow"}, calls[:1])[:2] == (["T1"], "exact")
 
 
+def test_numbers_override_match_words_that_point_at_the_wrong_call():
+    calls = [{"tool_call_id": "T1", "tool": "Bash", "arguments": {"command": "cat > deg.py; python deg.py"},
+              "output": "ModuleNotFoundError", "error": "tool reported an error"},
+             {"tool_call_id": "T2", "tool": "Bash", "arguments": {"command": "python3 - <<EOF ... EOF"},
+              "output": "IFIH1 pDC 0.093 cMono 0.152 B 0.206"}]
+    ids, link, _, signals = link_source({"tool": "Bash", "match": "deg.py"}, calls,
+                                        "IFIH1 log2FC pDC +0.093, monocyte +0.152, B cell +0.206")
+    assert (ids, link, signals) == (["T2"], "exact", ["tool", "numbers"])
+    # One shared number is not enough to override the words.
+    ids, _, _, signals = link_source({"tool": "Bash", "match": "deg.py"}, calls, "pDC 0.093")
+    assert ids == ["T1"] and "match" in signals
+    # Words that pick a call showing two of the numbers keep it, even if another shows more.
+    calls[0]["output"], calls[0]["error"] = "IFIH1 pDC 0.093 cMono 0.152", None
+    ids, _, _, signals = link_source({"tool": "Bash", "match": "deg.py"}, calls,
+                                     "IFIH1 log2FC pDC +0.093, monocyte +0.152, B cell +0.206")
+    assert ids == ["T1"] and signals == ["tool", "match", "numbers"]
+
+
 def test_unlinked_evidence_warns_the_agent(run):
     r = call(server._tool_write_hypothesis, "h", {"gene": "X", "cell_type": "B"}, 0.5,
              [ev("f", tool="Bash", match="nothing ran")], "r")
@@ -370,6 +389,10 @@ def test_workspace_view_and_metrics_for_a_ledger_run(run):
     assert m.completed and m.hypothesis_count == 1 and m.belief_revision_count == 1
     assert m.universe_tool_counts == {"OT_x": 1}
     assert m.tool_diversity["write_hypothesis"] == 1 and m.tool_diversity["declare_done"] == 1
+    # Turns are model responses, not Claude Code's num_turns (47 for a run that finished in 30).
+    Ledger(run).append([{"kind": "run_info", "phase": "end",
+                         "outcome": {"model_responses": 30, "turns_total": 47}}], "harness")
+    assert analyze_run(str(run)).turn_count == 30
 
 
 def test_artifact_entries(tmp_path):
