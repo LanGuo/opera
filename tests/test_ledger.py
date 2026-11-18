@@ -302,6 +302,42 @@ def test_numbers_override_match_words_that_point_at_the_wrong_call():
     assert ids == ["T1"] and signals == ["tool", "match", "numbers"]
 
 
+def test_agent_named_tool_call_ids_are_checked():
+    calls = [{"tool_call_id": "T13", "tool": "update_topic", "arguments": {}, "output": None,
+              "error": "Tool not found", "error_type": "tool_not_registered"},
+             {"tool_call_id": "T14", "tool": "find_tools", "arguments": {"query": "GWAS"}, "output": "tools"},
+             {"tool_call_id": "T15", "tool": "GWAS_x", "via": "execute_tool",
+              "arguments": {"gene_name": "STAT4"}, "output": "rs10168266 p 2e-48 beta 0.41"}]
+    finding = "rs10168266 in STAT4 (p-value 2e-48, beta 0.41)"
+    ids, link, _, signals = link_source({"tool_call_ids": ["T13"]}, calls, finding)   # failed call
+    assert (ids, link) == (["T15"], "exact") and signals == ["numbers", "tool_call_ids rejected: T13"]
+    ids, link, _, _ = link_source({"tool_call_ids": ["T14"]}, calls, finding)          # numbers absent
+    assert (ids, link) == (["T15"], "exact")
+    assert link_source({"tool_call_ids": ["T15"]}, calls, finding)[:2] == (["T15"], "exact")
+    assert link_source({"tool_call_ids": ["T14"]}, calls, "GWAS tools listed")[:2] == (["T14"], "exact")
+
+
+def test_identifiers_and_scientific_integers_link_and_check_named_ids():
+    # Gemini shake-down 5: three GWAS calls, ids named off by two.
+    calls = [{"tool_call_id": "T14", "tool": "find_tools", "arguments": {"query": "GWAS"}, "output": "GWAS tools"},
+             {"tool_call_id": "T15", "tool": "GWAS_x", "arguments": {"gene_name": "STAT4"},
+              "output": "GCST90270940 rs10168266 p_value 1e-160"},
+             {"tool_call_id": "T16", "tool": "GWAS_x", "arguments": {"gene_name": "PTPN22"},
+              "output": "GCST90270940 rs2476601 p_value 4e-98"},
+             {"tool_call_id": "T17", "tool": "GWAS_x", "arguments": {"gene_name": "IFIH1"},
+              "output": "GCST90999828 rs78456138 p_value 5e-8 GCST90270940"}]
+    f13 = "GWAS study (accession ID GCST90270940): SNP rs2476601 in PTPN22 (p-value = 4e-98)."
+    f14 = "GWAS study (accession ID GCST90999828): SNP rs78456138 in IFIH1 (p-value = 5e-8)."
+    assert link_source({"tool_call_ids": ["T14"]}, calls, f13)[:2] == (["T16"], "exact")
+    assert link_source({"tool_call_ids": ["T15"]}, calls, f14)[:2] == (["T17"], "exact")
+    assert link_source({"tool_call_ids": ["T16"]}, calls, f13)[:2] == (["T16"], "exact")
+    # one shared identifier alone is not enough
+    assert link_source({}, calls, "study GCST90270940 is large")[:2] == ([], "none")
+    from hypothesis_ledger.ledger import _NUMBER, _rounds_to
+    assert _NUMBER.findall("p = 1e-160, 5×10⁻⁸, n = 300, 0.41") == ["1e-160", "5×10⁻⁸", "0.41"]
+    assert _rounds_to("4e-98", {4.4e-98}) and not _rounds_to("4e-98", {5.1e-98})
+
+
 def test_unlinked_evidence_warns_the_agent(run):
     r = call(server._tool_write_hypothesis, "h", {"gene": "X", "cell_type": "B"}, 0.5,
              [ev("f", tool="Bash", match="nothing ran")], "r")

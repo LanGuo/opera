@@ -381,7 +381,12 @@ def task_rules_from_spec(spec: dict) -> dict:
 _WORD = re.compile(r"[A-Za-z0-9_.\-]+")       # keeps 'deg.py', 'gene_symbol', '218acb0f-9f2f'
 _PART = re.compile(r"[A-Za-z0-9]+")            # and their parts: 'deg', 'py', '218acb0f'
 _SCI = r"(?:\s*[eE]\s*[-+]?\d+|\s*[x×]\s*10\s*\^?\s*[-+−⁻]?[0-9⁰¹²³⁴⁵⁶⁷⁸⁹]+)?"
-_NUMBER = re.compile(r"-?\d+\.\d+" + _SCI)
+_SCI_REQUIRED = r"(?:\s*[eE]\s*[-+]?\d+|\s*[x×]\s*10\s*\^?\s*[-+−⁻]?[0-9⁰¹²³⁴⁵⁶⁷⁸⁹]+)"
+# Decimals ('0.226', '6.3e-10') and whole numbers in scientific notation ('1e-160', '5×10⁻⁸');
+# plain integers are too common to identify a call.
+_NUMBER = re.compile(r"-?\d+\.\d+" + _SCI + r"|(?<![\w.])-?\d+" + _SCI_REQUIRED)
+# Identifiers such as rs10168266, GCST90270940, ENSG00000163687: letters then 3+ digits.
+_IDENTIFIER = re.compile(r"\b[A-Za-z]{1,10}[_:-]?\d{3,}\b")
 _OUTPUT_NUMBER = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
 _SUPERSCRIPT = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹⁻−", "0123456789--")
 MATCH_MIN_SHARE = 0.5   # share of the words in source.match that must appear in a call's arguments
@@ -398,11 +403,11 @@ def _all_words(text: str) -> set[str]:
 def _parse_number(text: str) -> tuple[float, float]:
     """('6.3×10⁻¹⁰') -> (6.3e-10, half a unit in the last written place)."""
     t = text.translate(_SUPERSCRIPT).replace(" ", "")
-    m = re.match(r"(-?\d+\.(\d+))(?:[eE]([-+]?\d+)|[x×]10\^?([-+]?\d+))?$", t)
-    if not m:
+    m = re.match(r"(-?\d+(?:\.(\d+))?)(?:[eE]([-+]?\d+)|[x×]10\^?([-+]?\d+))?$", t)
+    if not m or (m.group(2) is None and m.group(3) is None and m.group(4) is None):
         return float("nan"), 0.0
     exp = int(m.group(3) or m.group(4) or 0)
-    places = len(m.group(2))
+    places = len(m.group(2) or "")
     return float(m.group(1)) * 10 ** exp, 0.5 * 10 ** (exp - places)
 
 
@@ -443,8 +448,11 @@ def link_source(source: dict, calls: list[dict], finding: str = "") -> tuple[lis
     Signals, applied in turn to narrow the candidates:
       tool     the call's tool name equals source.tool;
       match    most words of source.match appear in the call's arguments;
-      numbers  the finding's decimal numbers appear in the call's output (the most of them wins;
-               with no other signal, at least two must match).
+      identifiers  identifiers in the finding (rs10168266, GCST90270940) appear in the output
+               (the most of them wins; alone, at least two);
+      numbers  the finding's decimal and scientific-notation numbers appear in the call's output,
+               rounded or truncated (the most of them wins; with no other signal, at least two).
+    Ids the agent names in source.tool_call_ids are kept only if they pass the same checks.
     Returns (tool_call_ids, link, candidate ids, signals that matched). link is exact (one call
     left after at least one signal matched), probable (several left; the most recent is linked),
     citation (no call matched, a citation given) or none. Failed calls are dropped from the
@@ -452,9 +460,29 @@ def link_source(source: dict, calls: list[dict], finding: str = "") -> tuple[lis
     """
     source = source if isinstance(source, dict) else {}
     known = {c["tool_call_id"] for c in calls}
+    numbers = set(_NUMBER.findall(finding or ""))
+
+    def shows_numbers(c) -> int:
+        shown = _output_numbers(c)
+        return sum(1 for n in numbers if _rounds_to(n, shown))
+
+    idents = {i.lower() for i in _IDENTIFIER.findall(finding or "")}
+
+    def shows_idents(c) -> int:
+        out = (c.get("output") or "").lower()
+        return sum(1 for i in idents if re.search(r"(?<![a-z0-9])" + re.escape(i) + r"(?![a-z0-9])", out))
+
+    # Ids the agent names are checked like any other signal: agents guess them (Gemini shake-down
+    # 5 named T13-T15 for calls recorded as T15-T17). Named calls are kept only if none failed and,
+    # when the finding has two or more numbers, each shows at least two of them.
     named_ids = [i for i in source.get("tool_call_ids") or [] if i in known]
+    rejected = []
     if named_ids:
-        return named_ids, "exact", named_ids, ["tool_call_ids"]
+        named = [c for c in calls if c["tool_call_id"] in named_ids]
+        if all(not c.get("error") and (len(numbers) < 2 or shows_numbers(c) >= 2)
+               and (not idents or shows_idents(c) >= 1) for c in named):
+            return named_ids, "exact", named_ids, ["tool_call_ids"]
+        rejected = ["tool_call_ids rejected: " + ", ".join(named_ids)]
 
     candidates, signals = list(calls), []
     tool = str(source.get("tool") or "").strip().lower()
@@ -472,11 +500,15 @@ def link_source(source: dict, calls: list[dict], finding: str = "") -> tuple[lis
         if best >= MATCH_MIN_SHARE:
             candidates = [c for c in candidates if share(c) == best]
             signals.append("match")
-    numbers = set(_NUMBER.findall(finding or ""))
+    if idents:
+        # Identifiers the finding names (SNP, study, gene ids) narrow like numbers do: the calls
+        # showing the most of them; alone, at least two must be shown.
+        best = max((shows_idents(c) for c in candidates), default=0)
+        if best >= (1 if signals else 2):
+            candidates = [c for c in candidates if shows_idents(c) == best]
+            signals.append("identifiers")
     if numbers:
-        def found(c):
-            shown = _output_numbers(c)
-            return sum(1 for n in numbers if _rounds_to(n, shown))
+        found = shows_numbers
         best = max((found(c) for c in candidates), default=0)
         # The words of `match` can point at the wrong call: the agent names the script it wrote
         # in one call and ran in another. If the calls the words kept show fewer than two of the
@@ -497,11 +529,11 @@ def link_source(source: dict, calls: list[dict], finding: str = "") -> tuple[lis
         candidates = succeeded or candidates
         ids = [c["tool_call_id"] for c in candidates]
         if len(ids) == 1:
-            return ids, "exact", ids, signals
-        return [ids[-1]], "probable", ids, signals
+            return ids, "exact", ids, signals + rejected
+        return [ids[-1]], "probable", ids, signals + rejected
     if source.get("citation"):
-        return [], "citation", [], []
-    return [], "none", [], []
+        return [], "citation", [], rejected
+    return [], "none", [], rejected
 
 
 # --- Workspace files at the end of a run --------------------------------------------------------
