@@ -423,9 +423,18 @@ def _output_numbers(call: dict) -> set[float]:
 
 
 def _rounds_to(text: str, shown: set[float]) -> bool:
-    """A number as the agent wrote it ('-0.117', '6.3e-10') matches an output value that rounds to it."""
+    """A number as the agent wrote it ('-0.117', '6.3e-10') matches an output value that rounds
+    or truncates to it (agents do both: 1.3757e-263 was written as 1.37e-263)."""
     target, tol = _parse_number(text)
-    return tol > 0 and any(abs(x - target) <= tol * (1 + 1e-9) for x in shown)
+    if tol <= 0:
+        return False
+    eps = tol * 1e-9
+    for x in shown:
+        if abs(x - target) <= tol + eps:                                  # rounded
+            return True
+        if (x >= 0) == (target >= 0) and 0 <= abs(x) - abs(target) < 2 * tol + eps:   # truncated
+            return True
+    return False
 
 
 def link_source(source: dict, calls: list[dict], finding: str = "") -> tuple[list[str], str, list[str], list[str]]:

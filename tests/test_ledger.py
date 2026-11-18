@@ -443,6 +443,17 @@ def test_convert_v1_run(tmp_path):
     assert {e["evidence_id"] for e in h["evidence"]} == {"E1", "E2"}   # dropped item kept cited
 
 
+def test_numbers_match_rounded_or_truncated_values():
+    from hypothesis_ledger.ledger import _rounds_to
+    assert _rounds_to("1.37e-263", {1.3756595832559e-263})      # truncated (Gemini shake-down 4)
+    assert _rounds_to("1.38e-263", {1.3756595832559e-263})      # rounded
+    assert _rounds_to("0.226", {0.22600824})
+    assert _rounds_to("-0.116", {-0.116963}) and _rounds_to("-0.117", {-0.116963})
+    assert not _rounds_to("1.36e-263", {1.3756595832559e-263})
+    assert not _rounds_to("0.116", {-0.116963})                # sign must agree
+    assert not _rounds_to("2.0", {2.2})
+
+
 def test_link_uses_words_of_match_and_rounded_numbers():
     calls = [
         {"tool_call_id": "T1", "tool": "Bash", "cli_tool": "Bash",
