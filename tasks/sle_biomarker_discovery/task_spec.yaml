@@ -25,6 +25,8 @@ rubric:
     label: "Scientific Novelty"
     scope: per_hypothesis
     scale: "1-5"
+    pass: evidence
+    inputs: [evidence, tool_outputs]
     guidance: >
       Is this gene/cell-type combination a well-known SLE association or genuinely novel?
       Does multi-modal evidence (DEG, GWAS, protein interaction, literature) strengthen
@@ -33,6 +35,8 @@ rubric:
     label: "Experimental Design Quality"
     scope: per_hypothesis
     scale: "1-5"
+    pass: evidence
+    inputs: [validation_plan, evidence]
     guidance: >
       Feasibility of proposed validation (realistic cell numbers, reagents, assays),
       specificity to the hypothesis, statistical power (cohort size and controls),
@@ -41,6 +45,8 @@ rubric:
     label: "Evidence Strength"
     scope: per_hypothesis
     scale: "1-5"
+    pass: evidence
+    inputs: [evidence, tool_outputs]
     guidance: >
       Quality and independence of evidence modalities. Are at least 2 independent
       sources (scRNA-seq DEG, GWAS, protein interaction, literature, drug database)
@@ -49,6 +55,8 @@ rubric:
     label: "Clinical/Translational Relevance"
     scope: per_hypothesis
     scale: "1-5"
+    pass: evidence
+    inputs: [evidence, tool_outputs]
     guidance: >
       Potential clinical impact if validated — relevant to SLE diagnosis, disease
       monitoring, or treatment. Is the target druggable or measurable in clinical
@@ -57,6 +65,8 @@ rubric:
     label: "Reasoning Quality"
     scope: overall
     scale: "1-5"
+    pass: reasoning
+    inputs: [rationales, confidence_trajectory, evidence, "conclusion?"]
     guidance: >
       Did the agent update beliefs appropriately on evidence, handle contradictory
       findings, and seek diverse modalities rather than cherry-picking confirming
@@ -65,6 +75,8 @@ rubric:
     label: "Overall Scientific Quality"
     scope: overall
     scale: "1-5"
+    pass: run
+    inputs: [evidence, "conclusion?", tool_calls, notes]
     guidance: >
       Overall scientific rigor and quality of the discovery run — appropriate
       statistical methods, multi-modal evidence integration, and depth of exploration.
@@ -72,6 +84,8 @@ rubric:
     label: "Worth Pursuing in Wet Lab"
     scope: overall
     scale: "yes/no/partial"
+    pass: run
+    inputs: [conclusion, validation_plan, evidence]
     guidance: >
       Would the top hypotheses be worth pursuing in a wet lab validation study?
       Consider feasibility, novelty, and clinical relevance together.

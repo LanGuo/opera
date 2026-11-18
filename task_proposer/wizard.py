@@ -34,7 +34,7 @@ EXTRACTION_SYSTEM = (
     '  "hypothesis_constraints": [{"unique": ["attribute_name"], "among": ["active", "supported", "weakened"]}],\n'
     '  "rubric": [\n'
     '    {"id": "snake_case_id", "label": "Human-readable label", '
-    '"scope": "per_hypothesis", "scale": "1-5", '
+    '"scope": "per_hypothesis", "scale": "1-5", "pass": "evidence", "inputs": ["evidence", "tool_outputs"], '
     '"guidance": "1-2 sentence scoring guidance shown verbatim to both LLM and human reviewers"}\n'
     "  ]\n"
     "}\n"
@@ -45,6 +45,12 @@ EXTRACTION_SYSTEM = (
     "2-3 overall items (run-level quality). "
     "scope must be 'per_hypothesis' or 'overall'. scale must be '1-5' or 'yes/no/partial'. "
     "guidance must be specific to this task, not generic. "
+    "pass says which judge pass scores the item: 'evidence' (what was found and how strong it is; "
+    "per_hypothesis or overall), 'reasoning' (whether the agent's conclusions follow from what it "
+    "recorded) or 'run' (overall only). inputs lists what the judge must read, from: evidence, "
+    "tool_outputs, rationales, confidence_trajectory, open_questions, validation_plan, conclusion, "
+    "notes, human_input, tool_calls, agent_messages, or {\"artifacts\": \"<glob>\"} for files the agent "
+    "writes. The evidence pass may not read rationales, confidence_trajectory, notes or conclusion. "
     "hypothesis_attributes: the structured fields every hypothesis in this task names (e.g. a gene and a "
     "cell type, or a protein and a proposed driver); [] if a hypothesis is just a sentence. "
     "hypothesis_constraints: only rules the description implies, e.g. one hypothesis per gene; usually []. "
@@ -138,6 +144,10 @@ def _build_yaml(req: SaveRequest) -> str:
             lines.append(f"    label: '{_label}'")
             lines.append(f"    scope: {item.get('scope', 'per_hypothesis')}")
             lines.append(f"    scale: \"{item.get('scale', '1-5')}\"")
+            if item.get("pass"):
+                lines.append(f"    pass: {item['pass']}")
+            if item.get("inputs"):
+                lines.append(f"    inputs: {json.dumps(item['inputs'])}")
             guidance = item.get("guidance", "").replace("\n", " ").strip()
             lines.append(f"    guidance: >-")
             lines.append(f"      {guidance}")
@@ -257,7 +267,9 @@ function collectRubric() {
             label: label,
             scope: row.querySelector('.rubric-scope').value,
             scale: row.querySelector('.rubric-scale').value,
-            guidance: row.querySelector('.rubric-guidance-input').value.trim()
+            guidance: row.querySelector('.rubric-guidance-input').value.trim(),
+            pass: row.dataset.pass || undefined,
+            inputs: row.dataset.inputs ? JSON.parse(row.dataset.inputs) : undefined
         });
     });
     return items;
@@ -370,6 +382,8 @@ function addRubricItem(item) {
     var container = document.getElementById('rubric-items');
     var row = document.createElement('div');
     row.className = 'rubric-item-row';
+    if (item.pass) row.dataset.pass = item.pass;
+    if (item.inputs) row.dataset.inputs = JSON.stringify(item.inputs);
     row.style.cssText = 'border:1px solid #dde;border-radius:4px;padding:0.5rem;margin-bottom:0.5rem;';
     row.innerHTML =
         '<div style="display:grid;grid-template-columns:1fr 2fr auto;gap:0.5rem;margin-bottom:0.4rem">' +
@@ -465,6 +479,9 @@ async function saveTask() {
             '<div style="text-align:center;padding:4rem;font-family:system-ui,sans-serif">' +
             '<h2 style="color:#16a34a">✓ Task saved!</h2>' +
             '<p>Written to <code>' + escHtml(data.path) + '</code></p>' +
+            '<h3 style="margin-top:2rem">Judge inputs check</h3>' +
+            '<pre style="text-align:left;display:inline-block;max-width:90vw;white-space:pre-wrap">' + escHtml(data.check || '') + '</pre>' +
+            '<p>Fix any PROBLEM lines in the files, then run <code>uv run bioagent-check-task ' + escHtml(data.path) + ' --confirm</code>.</p>' +
             '<p style="color:#666">You can close this window. The server will shut down automatically.</p>' +
             '</div>';
     } catch(e) {
@@ -686,13 +703,19 @@ def post_save(req: SaveRequest):
     task_dir.mkdir(parents=True)
     (task_dir / "task_spec.yaml").write_text(_build_yaml(req), encoding="utf-8")
     (task_dir / "agent_task.md").write_text(req.agent_task_md, encoding="utf-8")
+    # Last page: what the judge will read for each criterion, and what the prompt fails to ask for.
+    try:
+        from reviewer.check_task import render, review
+        check = render(review(task_dir))
+    except Exception as exc:          # a malformed rubric is reported, the files stay saved
+        check = f"Task check failed: {exc}"
 
     def _shutdown():
         time.sleep(2)
         os._exit(0)
 
     threading.Thread(target=_shutdown, daemon=True).start()
-    return {"status": "ok", "path": f"tasks/{req.task_id}/"}
+    return {"status": "ok", "path": f"tasks/{req.task_id}/", "check": check}
 
 
 # ---------------------------------------------------------------------------

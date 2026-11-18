@@ -66,6 +66,8 @@ class LLMClient:
         # Model version the provider reports for the most recent response; an alias
         # like "gemini-2.5-flash" can resolve to different snapshots over time.
         self.last_model: str | None = None
+        # Why the provider stopped (e.g. max_tokens / MAX_TOKENS when the answer was cut off).
+        self.last_finish_reason: str | None = None
 
         self._anthropic_client = _anthropic_sdk.Anthropic() if backend == "anthropic" else None
         self._google_client = _genai.Client(api_key=os.environ.get("GOOGLE_API_KEY")) if backend == "google" else None
@@ -115,6 +117,7 @@ class LLMClient:
         assert self._anthropic_client is not None
         msg = self._anthropic_client.messages.create(**kwargs)
         self.last_model = getattr(msg, "model", None) or self.model
+        self.last_finish_reason = getattr(msg, "stop_reason", None)
         return msg.content[0].text if msg.content else ""
 
     def _chat_google(self, messages: list[dict], schema: dict | None) -> str:
@@ -144,6 +147,11 @@ class LLMClient:
             config=_genai.types.GenerateContentConfig(**config)
         )
         self.last_model = getattr(resp, "model_version", None) or self.model
+        try:
+            reason = resp.candidates[0].finish_reason
+            self.last_finish_reason = getattr(reason, "name", None) or str(reason)
+        except (AttributeError, IndexError, TypeError):
+            self.last_finish_reason = None
         return resp.text
 
     def _chat_ollama(self, messages: list[dict], schema: dict | None) -> str:
