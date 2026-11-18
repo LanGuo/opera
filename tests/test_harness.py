@@ -324,11 +324,11 @@ def test_matched_claude_turns_off_subagents_and_background_tasks(setup):
     assert p.details["subagents"].startswith("off")
 
 
-def test_matched_gemini_excludes_subagent_tool(setup):
+def test_matched_gemini_excludes_subagent_and_narration_tools(setup):
     _, _, run_dir = setup
     p = _plan(setup, "matched", "gemini-2.5-pro")
     settings = json.loads(p.files[run_dir / "workspace" / ".gemini" / "settings.json"])
-    assert settings["tools"]["exclude"] == ["invoke_agent"]
+    assert settings["tools"]["exclude"] == ["invoke_agent", "update_topic"]
     assert p.stop_on_result is True
 
 

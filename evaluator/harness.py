@@ -45,6 +45,8 @@ TOOLUNIVERSE_KEYS = ("NCBI_API_KEY", "BIOGRID_API_KEY", "DISGENET_API_KEY", "NVI
 # Claude Code's init record lists the subagent tool as "Task"; the model calls it as "Agent".
 CLAUDE_SUBAGENT_TOOLS = ("Agent", "Task")
 GEMINI_SUBAGENT_TOOL = "invoke_agent"
+# Gemini CLI 0.68 added a narration-only tool the Tier 2 CLI (0.50) didn't have (D-39).
+GEMINI_EXCLUDED_TOOLS = (GEMINI_SUBAGENT_TOOL, "update_topic")
 # Python for each run's own environment. cellxgene-census's tiledbsoma doesn't build on 3.14.
 RUN_PYTHON = "3.12"
 # Pinned ToolUniverse, started through a launcher that checks the version.
@@ -210,7 +212,7 @@ def plan_run(
     # through invoke_agent unless the tool itself is excluded.
     # ToolUniverse saves large results under TMPDIR, outside the workspace, and Gemini CLI's file
     # tools refuse paths outside the workspace unless the directory is included (Claude's don't).
-    settings = {"model": {"maxSessionTurns": cap}, "tools": {"exclude": [GEMINI_SUBAGENT_TOOL]},
+    settings = {"model": {"maxSessionTurns": cap}, "tools": {"exclude": list(GEMINI_EXCLUDED_TOOLS)},
                 "context": {"includeDirectories": [str(tmp)]}, "mcpServers": servers, **hooks}
     argv = ["gemini", "-p", USER_PROMPT, "--model", model, "--output-format", "stream-json",
             "--approval-mode", "yolo", "--skip-trust"]
@@ -225,6 +227,7 @@ def plan_run(
                  "turn_cap": f"model.maxSessionTurns {cap}",
                  "turn_warning": warning_detail,
                  "subagents": f"off (tools.exclude {GEMINI_SUBAGENT_TOOL})",
+                 "narration_tool": "off (tools.exclude update_topic)",
                  "background_tasks": "on (background shell processes don't wake the agent; "
                                      "maxSessionTurns is a hard stop)",
                  **env_details,
