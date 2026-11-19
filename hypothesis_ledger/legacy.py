@@ -6,7 +6,9 @@ The old run directory is not modified; out_dir gets ledger.jsonl and a copy of t
 What the old files can't supply is stated in the run_info start entry (`conversion_limits`):
 
 - creation entries have no rationale (the old write_hypothesis took none);
-- evidence items aren't linked to tool calls (`link: none`), since the old tools recorded no source;
+- evidence items aren't linked to tool calls, since the old tools recorded no source; the source an
+  old item named becomes its citation (`link: citation`, unchecked), otherwise `link: none`;
+- the agent's own `strength` rating of an item is kept only in `extra.v1_item`, out of the finding;
 - old updates rewrote the hypothesis text and attributes in place; the creation values are kept and
   each rewrite is listed in the update entry's `v1_rewrites`;
 - evidence an old update dropped from the list is kept cited (most drops were accidental, see D-29);
@@ -24,7 +26,9 @@ from .ledger import STATUSES, IdCounter, Ledger, StreamParser, task_rules_from_s
 
 CONVERSION_LIMITS = [
     "creation entries have no rationale",
-    "evidence items are not linked to tool calls",
+    "evidence items are not linked to tool calls; the source an old item named is its citation",
+    "the agent's strength rating of each item is kept only in extra.v1_item",
+    "one validation plan for the whole run (conclusion.validation['run'])",
     "in-place rewrites of hypothesis text or attributes are listed in v1_rewrites",
     "evidence dropped by old updates is kept cited",
     "entries are grouped by kind, not in time order",
@@ -100,10 +104,18 @@ def convert_v1(old_run_dir, out_dir) -> Path:
     id_map: dict[str, str] = {}
 
     def item_of(raw, ids) -> dict:
-        kind, text = evidence_parts(raw)
-        return {"evidence_id": ids.next("E"), "finding": text or _norm(raw),
-                "source": {"v1_kind": kind} if kind else {}, "relation": "supports",
-                "tool_call_ids": [], "link": "none", "extra": {"v1_item": raw}}
+        # The agent's own `strength` rating is interpretation, which pass E must not see; the
+        # source it named becomes the citation (unchecked, like any v2 citation).
+        cited = str(raw.get("source") or "").strip() if isinstance(raw, dict) else ""
+        shown = ({k: v for k, v in raw.items() if k not in ("source", "strength")}
+                 if isinstance(raw, dict) else raw)
+        kind, text = evidence_parts(shown)
+        source = {"v1_kind": kind} if kind else {}
+        if cited:
+            source["citation"] = cited
+        return {"evidence_id": ids.next("E"), "finding": text or cited or _norm(shown),
+                "source": source, "relation": "supports", "tool_call_ids": [],
+                "link": "citation" if cited else "none", "extra": {"v1_item": raw}}
 
     for h in hyps:
         def build(ids, h=h):

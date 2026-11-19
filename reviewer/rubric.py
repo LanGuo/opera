@@ -143,7 +143,7 @@ def missing_inputs(c: Criterion, run, hypothesis_id: str | None = None) -> list[
             missing.append("conclusion (the agent never called declare_done)")
         elif name == "validation_plan":
             plans = (conclusion or {}).get("validation") or {}
-            if hypothesis_id is not None and not str(plans.get(hypothesis_id, "")).strip():
+            if hypothesis_id is not None and not run.validation_for(hypothesis_id):
                 missing.append(f"validation_plan for {hypothesis_id}"
                                + ("" if conclusion else " (no declare_done)"))
             elif hypothesis_id is None and not plans:

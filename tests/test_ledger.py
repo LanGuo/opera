@@ -456,7 +456,10 @@ def test_convert_v1_run(tmp_path):
                             "changes": {"from": {"confidence": 0.5, "claim": "old claim",
                                                  "evidence": [{"type": "scRNA", "description": "lfc 3"}]},
                                         "to": {"confidence": 0.8, "claim": "new claim",
-                                               "evidence": [{"type": "lit", "description": "paper"}]}}}]}}}))
+                                               "evidence": [{"type": "lit", "description": "paper"},
+                                                            {"modality": "GWAS", "finding": "rs1 p 1e-9",
+                                                             "source": "Bentham 2015 (PMID:1)",
+                                                             "strength": "strong"}]}}}]}}}))
     (old / "step_log.jsonl").write_text(json.dumps({"step_type": "Debugging", "interpretation": "fixed"}) + "\n")
     (old / "final_report.json").write_text(json.dumps({"top_hypotheses": [{"hypothesis_id": "AB12"}],
                                                        "rationale": "done", "suggested_validation": "flow"}))
@@ -470,13 +473,24 @@ def test_convert_v1_run(tmp_path):
     assert create["evidence"][0]["finding"] == "lfc 3" and create["evidence"][0]["link"] == "none"
     assert update["rationale"] == "DE found" and update["v1_rewrites"] == {"claim": "new claim"}
     assert update["evidence"][0]["finding"] == "paper"
+    gwas = update["evidence"][1]           # the agent's strength rating stays out of the finding
+    assert gwas["finding"] == "rs1 p 1e-9" and gwas["link"] == "citation"
+    assert gwas["source"] == {"v1_kind": "GWAS", "citation": "Bentham 2015 (PMID:1)"}
+    assert gwas["extra"]["v1_item"]["strength"] == "strong"
+    from reviewer.judge_inputs import RUN_PLAN_NOTE, build_run_view
+    from reviewer.rubric import load_criteria, missing_inputs
+    run = build_run_view(out)
+    assert run.validation_for("H1") == RUN_PLAN_NOTE + "flow"      # one plan for the whole run
+    design = load_criteria({"rubric": [{"id": "d", "pass": "evidence",
+                                        "inputs": ["validation_plan", "evidence"]}]})[0][0]
+    assert missing_inputs(design, run, "H1") == []
     assert led.entries("note")[0]["note_kind"] == "debug"
     assert led.conclusion()["ranked_hypothesis_ids"] == ["H1"]
     assert len(led.entries("tool_call")) == 1
     assert "creation entries have no rationale" in led.run_info("start")["conversion_limits"]
     assert not (old / "ledger.jsonl").exists()     # the old run is left alone
     h = Workspace(out).read_ledger()["hypotheses"]["H1"]
-    assert {e["evidence_id"] for e in h["evidence"]} == {"E1", "E2"}   # dropped item kept cited
+    assert {e["evidence_id"] for e in h["evidence"]} == {"E1", "E2", "E3"}   # dropped item kept cited
 
 
 def test_numbers_match_rounded_or_truncated_values():

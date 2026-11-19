@@ -27,6 +27,8 @@ from hypothesis_ledger.ledger import Ledger
 MAX_OUTPUT_CHARS = 2000
 UNCITED_OUTPUT_CHARS = 200
 NO_SOURCE = "no recorded source"
+RUN_PLAN_KEY = "run"   # conclusion.validation key of runs converted from v1
+RUN_PLAN_NOTE = "(one plan for the whole run, not written for this hypothesis) "
 
 
 def cut(text: str | None, limit: int) -> str:
@@ -92,7 +94,12 @@ class RunView:
     cited_call_ids: set[str] = field(default_factory=set)
 
     def validation_for(self, hid: str) -> str:
-        return str(((self.conclusion or {}).get("validation") or {}).get(hid, "") or "").strip()
+        plans = (self.conclusion or {}).get("validation") or {}
+        plan = str(plans.get(hid, "") or "").strip()
+        if not plan and set(plans) == {RUN_PLAN_KEY} and str(plans[RUN_PLAN_KEY] or "").strip():
+            # Runs converted from v1 have one plan for the whole run (final_report.suggested_validation).
+            plan = RUN_PLAN_NOTE + str(plans[RUN_PLAN_KEY]).strip()
+        return plan
 
 
 def build_run_view(run_dir) -> RunView:
