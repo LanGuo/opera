@@ -560,3 +560,31 @@ def test_cli_persisted_output_recorded_in_full(tmp_path):
     assert calls["t2"]["output"] == "r=-0.406" and calls["t2"]["output_persisted_by_cli"]
     assert calls["t3"]["output"] == preview and "output_persisted_by_cli" not in calls["t3"]
     assert calls["t4"]["output"] == "a.txt" and "output_persisted_by_cli" not in calls["t4"]
+
+
+def test_cli_over_token_limit_result_read_from_saved_file(tmp_path):
+    """Over Claude Code's token limit an MCP result is replaced by a message naming the file it was
+    saved to (batch 1 redo, D-48); the ledger reads that file, but only from inside the run dir."""
+    saved = tmp_path / "harness" / "tool-results" / "mcp-execute_tool-1.txt"
+    saved.parent.mkdir(parents=True)
+    saved.write_text('{"target_symbol": "ISG15", "score": 0.8449555672064456}', encoding="utf-8")
+    outside = tmp_path.parent / f"{tmp_path.name}_outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+
+    def msg(p):
+        return (f"Error: result (100,000 characters across 1 line) exceeds maximum allowed tokens. "
+                f"Output has been saved to {p}.\nFormat: Plain text\n- For targeted searches ...")
+    recs = claude_call("t1", "mcp__tooluniverse__execute_tool", {"tool_name": "x"}, msg(saved))
+    recs[1]["tool_use_result"] = msg(saved)
+    out = claude_call("t2", "mcp__tooluniverse__execute_tool", {"tool_name": "x"}, msg(outside))
+    gone = claude_call("t3", "mcp__tooluniverse__execute_tool", {"tool_name": "x"}, msg(tmp_path / "no.txt"))
+    preview = f"<persisted-output>\nOutput too large (68KB). Full output saved to: {saved}\n\nPreview..."
+    pv = claude_call("t4", "Bash", {"command": "cat big"}, preview)        # no tool_use_result: file
+    _w(tmp_path / "transcript.jsonl", recs + out + gone + pv)
+    calls = {c["cli_call_id"]: c for c in StreamParser(tmp_path / "transcript.jsonl").read(final=True)
+             if c["kind"] == "tool_call"}
+    assert "0.8449555672064456" in calls["t1"]["output"] and calls["t1"]["output_persisted_by_cli"]
+    assert calls["t2"]["output"] == msg(outside) and "output_persisted_by_cli" not in calls["t2"]
+    assert "output_persisted_by_cli" not in calls["t3"]
+    assert "ISG15" in calls["t4"]["output"] and calls["t4"]["output_persisted_by_cli"]
+    outside.unlink()

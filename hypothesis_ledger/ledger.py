@@ -89,6 +89,35 @@ def _full_result(value) -> str | None:
     return value if isinstance(value, str) and value and not value.lstrip().startswith(_PERSISTED) else None
 
 
+# An MCP result over Claude Code's token limit is not shown at all: the agent gets this message and
+# the result is saved to a file, the only place it exists.
+_SAVED = re.compile(r"^Error: result \(.*?\) exceeds maximum allowed tokens\. "
+                    r"Output has been saved to (\S+?)\.?\s*$", re.M)
+_PERSISTED_PATH = re.compile(r"Full output saved to: (\S+)")
+
+
+def _saved_file(text: str, base: Path) -> str | None:
+    """The result Claude Code saved to a file, read only from inside `base` (the run directory)."""
+    m = _SAVED.search(text) if text.lstrip().startswith("Error: result") else (
+        _PERSISTED_PATH.search(text) if text.lstrip().startswith(_PERSISTED) else None)
+    if not m:
+        return None
+    try:
+        f = Path(m.group(1)).resolve()
+        if not f.is_relative_to(base.resolve()) or not f.is_file():
+            return None
+        raw = f.read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError):
+        return None
+    if f.suffix == ".json":
+        try:
+            val = json.loads(raw)
+            return _full_result(val) or raw
+        except json.JSONDecodeError:
+            pass
+    return raw or None
+
+
 class StreamParser:
     """Turns complete lines of a Claude Code or Gemini CLI stream-json file into ledger entries.
 
@@ -161,11 +190,14 @@ class StreamParser:
                        if isinstance(b, dict) and b.get("type") == "tool_result"]
             for block in results:
                 text = _result_text(block.get("content"))
-                persisted = text.lstrip().startswith(_PERSISTED) and len(results) == 1
+                head = text.lstrip()
+                persisted = head.startswith((_PERSISTED, "Error: result")) and len(results) == 1
                 if persisted:
-                    # Claude Code replaces a large result with a 2 KB preview and a file path; the
-                    # record's tool_use_result still holds the whole result.
-                    full = _full_result(rec.get("tool_use_result"))
+                    # Claude Code replaces a large result with a 2 KB preview and a file path (the
+                    # record's tool_use_result still holds the whole result), or, over its token
+                    # limit, with only the path to the file it saved.
+                    full = (_full_result(rec.get("tool_use_result")) if head.startswith(_PERSISTED)
+                            else None) or _saved_file(text, self.path.parent)
                     persisted = bool(full)
                     text = full or text
                 found = self._finish(block.get("tool_use_id"), text,
