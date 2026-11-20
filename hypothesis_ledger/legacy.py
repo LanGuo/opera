@@ -7,7 +7,8 @@ What the old files can't supply is stated in the run_info start entry (`conversi
 
 - creation entries have no rationale (the old write_hypothesis took none);
 - evidence items aren't linked to tool calls, since the old tools recorded no source; the source an
-  old item named becomes its citation (`link: citation`, unchecked), otherwise `link: none`;
+  old item named becomes its citation (`link: citation`, unchecked), otherwise `link: none` with
+  `source.unrecorded_reason`, so reviewers see why there is no source;
 - the agent's own `strength` rating of an item is kept only in `extra.v1_item`, out of the finding;
 - old updates rewrote the hypothesis text and attributes in place; the creation values are kept and
   each rewrite is listed in the update entry's `v1_rewrites`;
@@ -24,6 +25,7 @@ from pathlib import Path
 
 from .ledger import STATUSES, IdCounter, Ledger, StreamParser, task_rules_from_spec
 
+V1_NO_SOURCE = "the old ledger tools recorded no sources"
 CONVERSION_LIMITS = [
     "creation entries have no rationale",
     "evidence items are not linked to tool calls; the source an old item named is its citation",
@@ -113,6 +115,8 @@ def convert_v1(old_run_dir, out_dir) -> Path:
         source = {"v1_kind": kind} if kind else {}
         if cited:
             source["citation"] = cited
+        else:
+            source["unrecorded_reason"] = V1_NO_SOURCE
         return {"evidence_id": ids.next("E"), "finding": text or cited or _norm(shown),
                 "source": source, "relation": "supports", "tool_call_ids": [],
                 "link": "citation" if cited else "none", "extra": {"v1_item": raw}}

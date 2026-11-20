@@ -156,6 +156,8 @@ def _source_text(ev: EvidenceView) -> str:
         return f"citation: {s['citation']}"
     if s.get("tool") or s.get("match"):
         return f"tool: {s.get('tool', '')}; match: {s.get('match', '')}"
+    if s.get("unrecorded_reason"):      # e.g. runs converted from v1, whose tools took no source
+        return f"not recorded ({s['unrecorded_reason']})"
     return NO_SOURCE
 
 
@@ -185,7 +187,7 @@ def _render_item(run: RunView, ev: EvidenceView, max_chars: int, relation: str |
         lines.append(f"    Quantities: {json.dumps(ev.quantities, ensure_ascii=False)}")
     if ev.link in ("exact", "probable") and with_calls:
         lines += _render_calls(run, ev, max_chars)
-    elif ev.link in ("none",) and not ev.source.get("citation"):
+    elif ev.link in ("none",) and not ev.source.get("citation") and not ev.source.get("unrecorded_reason"):
         lines.append(f"    ({NO_SOURCE})")
     return lines
 

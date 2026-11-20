@@ -484,6 +484,12 @@ def test_convert_v1_run(tmp_path):
     design = load_criteria({"rubric": [{"id": "d", "pass": "evidence",
                                         "inputs": ["validation_plan", "evidence"]}]})[0][0]
     assert missing_inputs(design, run, "H1") == []
+    from hypothesis_ledger.legacy import V1_NO_SOURCE
+    from reviewer.judge_inputs import NO_SOURCE, _render_item
+    unsourced = create["evidence"][0]       # old tools took no source: say so, not "no recorded source"
+    assert unsourced["source"]["unrecorded_reason"] == V1_NO_SOURCE
+    text = "\n".join(_render_item(run, run.hypotheses["H1"].evidence[unsourced["evidence_id"]], 2000))
+    assert f"not recorded ({V1_NO_SOURCE})" in text and NO_SOURCE not in text
     assert led.entries("note")[0]["note_kind"] == "debug"
     assert led.conclusion()["ranked_hypothesis_ids"] == ["H1"]
     assert len(led.entries("tool_call")) == 1
