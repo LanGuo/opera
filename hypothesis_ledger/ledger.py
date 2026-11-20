@@ -75,6 +75,20 @@ def _result_text(content) -> str:
     return "\n".join(parts)
 
 
+_PERSISTED = "<persisted-output>"
+
+
+def _full_result(value) -> str | None:
+    """The whole result from a Claude Code record's `tool_use_result`: text blocks (MCP tools) or
+    a dict with stdout/stderr (Bash)."""
+    if isinstance(value, list):
+        return _result_text(value) or None
+    if isinstance(value, dict):
+        parts = [value.get("stdout") or "", value.get("stderr") or ""]
+        return "\n".join(p for p in parts if p) or None
+    return value if isinstance(value, str) and value and not value.lstrip().startswith(_PERSISTED) else None
+
+
 class StreamParser:
     """Turns complete lines of a Claude Code or Gemini CLI stream-json file into ledger entries.
 
@@ -143,11 +157,23 @@ class StreamParser:
                                                                block.get("id"), None)
         elif kind == "user":                          # Claude: tool results
             content = (rec.get("message") or {}).get("content") or []
-            for block in content if isinstance(content, list) else []:
-                if isinstance(block, dict) and block.get("type") == "tool_result":
-                    out.extend(self._finish(block.get("tool_use_id"), _result_text(block.get("content")),
-                                            "tool reported an error" if block.get("is_error") else None,
-                                            None))
+            results = [b for b in (content if isinstance(content, list) else [])
+                       if isinstance(b, dict) and b.get("type") == "tool_result"]
+            for block in results:
+                text = _result_text(block.get("content"))
+                persisted = text.lstrip().startswith(_PERSISTED) and len(results) == 1
+                if persisted:
+                    # Claude Code replaces a large result with a 2 KB preview and a file path; the
+                    # record's tool_use_result still holds the whole result.
+                    full = _full_result(rec.get("tool_use_result"))
+                    persisted = bool(full)
+                    text = full or text
+                found = self._finish(block.get("tool_use_id"), text,
+                                     "tool reported an error" if block.get("is_error") else None, None)
+                for e in found:
+                    if persisted:
+                        e["output_persisted_by_cli"] = True
+                out.extend(found)
         elif kind == "tool_use":                      # Gemini
             self.pending[rec.get("tool_id")] = self._call(rec.get("tool_name"), rec.get("parameters"),
                                                           rec.get("tool_id"), rec.get("timestamp"))

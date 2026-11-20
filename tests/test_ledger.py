@@ -538,3 +538,25 @@ def test_evidence_entry_records_link_signals(run):
          [ev("lfc 2.10, p 0.031", tool="Bash", match="deg.py")], "r")
     item = Ledger(run).entries("hypothesis")[0]["evidence"][0]
     assert item["link"] == "exact" and item["link_signals"] == ["tool", "match", "numbers"]
+
+
+def test_cli_persisted_output_recorded_in_full(tmp_path):
+    """Claude Code swaps a large result for a preview and a file path (batch 2, D-47); the ledger
+    keeps the whole result from the record's tool_use_result."""
+    preview = "<persisted-output>\nOutput too large (68KB). Full output saved to: /x/t.json\n\nPreview (first 2KB):\n[..."
+    full_mcp = "AUC=0.892 " * 5000
+    recs = claude_call("t1", "mcp__tooluniverse__execute_tool", {"tool_name": "Lit"}, preview)
+    recs[1]["tool_use_result"] = [{"type": "text", "text": full_mcp}]
+    bash = claude_call("t2", "Bash", {"command": "cat big"}, preview)
+    bash[1]["tool_use_result"] = {"stdout": "r=-0.406", "stderr": "", "interrupted": False,
+                                  "persistedOutputPath": "/x/b.txt"}
+    lost = claude_call("t3", "Bash", {"command": "cat big"}, preview)   # no tool_use_result: keep preview
+    small = claude_call("t4", "Bash", {"command": "ls"}, "a.txt")
+    small[1]["tool_use_result"] = {"stdout": "a.txt"}
+    _w(tmp_path / "transcript.jsonl", recs + bash + lost + small)
+    calls = {c["cli_call_id"]: c for c in StreamParser(tmp_path / "transcript.jsonl").read(final=True)
+             if c["kind"] == "tool_call"}
+    assert calls["t1"]["output"] == full_mcp and calls["t1"]["output_persisted_by_cli"] is True
+    assert calls["t2"]["output"] == "r=-0.406" and calls["t2"]["output_persisted_by_cli"]
+    assert calls["t3"]["output"] == preview and "output_persisted_by_cli" not in calls["t3"]
+    assert calls["t4"]["output"] == "a.txt" and "output_persisted_by_cli" not in calls["t4"]
