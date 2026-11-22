@@ -118,6 +118,50 @@ def _saved_file(text: str, base: Path) -> str | None:
     return raw or None
 
 
+# Gemini CLI's stream carries a tool's display text (`resultDisplay`), which for some tools is only
+# a summary: google_web_search gives 'Search results for "…" returned.' while the model got the
+# results. What the model got is in the CLI's own session file, harness/gemini-home/.gemini/tmp/
+# <project>/chats/session-*.jsonl, in the call's functionResponse.
+_GEMINI_CHATS = ("harness", "gemini-home", ".gemini", "tmp", "*", "chats", "*.jsonl")
+_HOOK_CONTEXT = re.compile(r"\s*<hook_context>.*?</hook_context>\s*", re.S)
+_GEMINI_SUMMARY_TOOLS = {"google_web_search", "web_fetch"}   # wait for the session file
+
+
+def _gemini_session_output(run_dir: Path, cli_id: str) -> str | None:
+    """What the model was given for Gemini call `cli_id`, from the CLI's session file; our own
+    turn-budget hook text is removed. None if the session file doesn't have it (yet)."""
+    if not cli_id:
+        return None
+    best = None
+    for f in Path(run_dir).glob("/".join(_GEMINI_CHATS)):
+        try:
+            lines = f.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if cli_id not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            responses = [p.get("functionResponse") for c in rec.get("toolCalls") or []
+                         if isinstance(c, dict) and c.get("id") == cli_id
+                         for p in (c.get("result") or []) if isinstance(p, dict)]
+            if isinstance(rec.get("content"), list):
+                responses += [p.get("functionResponse") for p in rec["content"] if isinstance(p, dict)]
+            for r in responses:
+                if not isinstance(r, dict) or r.get("id") != cli_id:
+                    continue
+                resp = r.get("response")
+                text = resp.get("output") if isinstance(resp, dict) and isinstance(resp.get("output"), str) \
+                    else json.dumps(resp, ensure_ascii=False)
+                text = _HOOK_CONTEXT.sub("\n", text).strip()
+                if text and (best is None or len(text) > len(best)):
+                    best = text
+    return best
+
+
 class StreamParser:
     """Turns complete lines of a Claude Code or Gemini CLI stream-json file into ledger entries.
 
@@ -131,6 +175,7 @@ class StreamParser:
         self.line_no = 0
         self.pending: dict[str, dict] = {}      # cli call id -> call without a result yet
         self.gemini_text: dict | None = None    # assistant text deltas being joined
+        self.awaiting: dict[str, dict] = {}     # Gemini results waiting for the CLI's session file
 
     def read(self, final: bool = False) -> list[dict]:
         out: list[dict] = []
@@ -153,6 +198,8 @@ class StreamParser:
                     except json.JSONDecodeError:
                         continue
                     out.extend(self._record(rec))
+        for rec in list(self.awaiting.values()):
+            out.extend(self._gemini_result(rec, final=final))
         if final:
             out.extend(self._flush_text())
             for cli_id, call in self.pending.items():
@@ -210,14 +257,7 @@ class StreamParser:
             self.pending[rec.get("tool_id")] = self._call(rec.get("tool_name"), rec.get("parameters"),
                                                           rec.get("tool_id"), rec.get("timestamp"))
         elif kind == "tool_result":                   # Gemini
-            err = rec.get("error")
-            error = (err.get("message") or err.get("type") or "error") if isinstance(err, dict) else (
-                "tool reported an error" if rec.get("status") not in (None, "success") else None)
-            found = self._finish(rec.get("tool_id"), rec.get("output"), error, rec.get("timestamp"))
-            if isinstance(err, dict) and err.get("type"):
-                for e in found:
-                    e["error_type"] = err["type"]
-            out.extend(found)
+            out.extend(self._gemini_result(rec, final=False))
         elif kind == "message" and rec.get("role") == "assistant":   # Gemini text (deltas)
             text = rec.get("content") or ""
             if self.gemini_text is None:
@@ -225,6 +265,35 @@ class StreamParser:
                                     "stream_key": f"msg:{self.line_no}:0"}
             self.gemini_text["text"] += text if isinstance(text, str) else json.dumps(text)
         return out
+
+    def _gemini_result(self, rec: dict, final: bool) -> list[dict]:
+        cli_id = rec.get("tool_id")
+        shown = rec.get("output")
+        shown = shown if isinstance(shown, str) or shown is None else json.dumps(shown, ensure_ascii=False)
+        full = _gemini_session_output(self.path.parent, cli_id)
+        call = self.pending.get(cli_id) or {}
+        if full is None and not final and call.get("cli_tool") in _GEMINI_SUMMARY_TOOLS:
+            self.awaiting[cli_id] = rec          # session file not written yet: try again later
+            return []
+        self.awaiting.pop(cli_id, None)
+        # The display text is kept when it is the whole result: shell output (what the model got only
+        # adds the CLI's wrapper) and large MCP results (the model got a shortened copy). Only an
+        # empty or summary display, shorter than what the model got and not part of it, is replaced.
+        s = (shown or "").strip()
+        replaced = bool(full) and (not s or (s not in full and len(full) > len(s)))
+        err = rec.get("error")
+        error = (err.get("message") or err.get("type") or "error") if isinstance(err, dict) else (
+            "tool reported an error" if rec.get("status") not in (None, "success") else None)
+        found = self._finish(cli_id, full if replaced else shown, error, rec.get("timestamp"))
+        for e in found:
+            if isinstance(err, dict) and err.get("type"):
+                e["error_type"] = err["type"]
+            if replaced:
+                e["output_from_cli_session"] = True
+                e["output_display"] = shown
+            elif full is None and call.get("cli_tool") in _GEMINI_SUMMARY_TOOLS:
+                e["output_display_only"] = True
+        return found
 
     def _call(self, cli_name, arguments, cli_id, started) -> dict:
         server, tool = split_tool_name(cli_name or "")

@@ -594,3 +594,63 @@ def test_cli_over_token_limit_result_read_from_saved_file(tmp_path):
     assert "output_persisted_by_cli" not in calls["t3"]
     assert "ISG15" in calls["t4"]["output"] and calls["t4"]["output_persisted_by_cli"]
     outside.unlink()
+
+
+def _gemini_session(tmp_path, responses):
+    chats = tmp_path / "harness" / "gemini-home" / ".gemini" / "tmp" / "workspace" / "chats"
+    chats.mkdir(parents=True, exist_ok=True)
+    recs = [{"sessionId": "s", "kind": "main"}]
+    for cid, name, out in responses:
+        recs.append({"id": "m" + cid, "type": "gemini", "toolCalls": [
+            {"id": cid, "name": name, "resultDisplay": "shown",
+             "result": [{"functionResponse": {"id": cid, "name": name, "response": {"output": out}}}]}]})
+    (chats / "session-1.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+
+
+def test_gemini_summary_output_replaced_by_what_the_model_got(tmp_path):
+    """Gemini CLI streams only a display line for google_web_search; the ledger takes what the model
+    got from the CLI's session file (D-59), waiting for that file if needed."""
+    _w(tmp_path / "transcript.jsonl", [
+        {"type": "tool_use", "tool_name": "google_web_search", "tool_id": "w1", "parameters": {"query": "q"}},
+        {"type": "tool_result", "tool_id": "w1", "status": "success", "output": 'Search results for "q" returned.'},
+        {"type": "tool_use", "tool_name": "run_shell_command", "tool_id": "s1", "parameters": {"command": "ls"}},
+        {"type": "tool_result", "tool_id": "s1", "status": "success", "output": "a.txt b.txt"},
+        {"type": "tool_use", "tool_name": "write_file", "tool_id": "f1", "parameters": {"file_path": "x"}},
+        {"type": "tool_result", "tool_id": "f1", "status": "success"}])
+    others = [("s1", "run_shell_command", "Output: a.txt b.txt\nExit Code: 0"),
+              ("f1", "write_file", "Successfully wrote x")]
+    _gemini_session(tmp_path, others)
+    led = Ledger(tmp_path)
+    led.sync_stream()
+    assert {c["cli_call_id"] for c in led.entries("tool_call")} == {"s1", "f1"}   # w1 waits
+    _gemini_session(tmp_path, [("w1", "google_web_search", 'Web search results for "q":\nPerez 2022 '
+                                "profiled 1.2 million PBMCs.\n<hook_context>Turn budget: 4 turns left"
+                                "</hook_context>")] + others)
+    led.sync_stream()
+    calls = {c["cli_call_id"]: c for c in led.entries("tool_call")}
+    w, s, f = calls["w1"], calls["s1"], calls["f1"]
+    assert w["output"] == 'Web search results for "q":\nPerez 2022 profiled 1.2 million PBMCs.'
+    assert w["output_from_cli_session"] and w["output_display"] == 'Search results for "q" returned.'
+    assert s["output"] == "a.txt b.txt" and "output_from_cli_session" not in s   # display is the result
+    assert f["output"] == "Successfully wrote x" and f["output_from_cli_session"]
+
+
+def test_gemini_summary_without_session_file_kept_and_flagged_at_run_end(tmp_path):
+    _w(tmp_path / "transcript.jsonl", [
+        {"type": "tool_use", "tool_name": "google_web_search", "tool_id": "w1", "parameters": {"query": "q"}},
+        {"type": "tool_result", "tool_id": "w1", "status": "success", "output": 'Search results for "q" returned.'}])
+    p = StreamParser(tmp_path / "transcript.jsonl")
+    assert p.read() == []
+    (c,) = p.read(final=True)
+    assert c["output"] == 'Search results for "q" returned.' and c["output_display_only"]
+
+
+def test_gemini_full_stream_result_kept_when_the_model_got_a_shortened_copy(tmp_path):
+    full = '{"articles": [' + ", ".join(f'"a{i}"' for i in range(3000)) + "]}"
+    _w(tmp_path / "transcript.jsonl", [
+        {"type": "tool_use", "tool_name": "mcp_tooluniverse_execute_tool", "tool_id": "m1", "parameters": {}},
+        {"type": "tool_result", "tool_id": "m1", "status": "success", "output": full}])
+    _gemini_session(tmp_path, [("m1", "mcp_tooluniverse_execute_tool",
+                                "Output too large. Showing first 8,000 and last 32,000 characters.\n" + full[:500])])
+    (c,) = StreamParser(tmp_path / "transcript.jsonl").read(final=True)
+    assert c["output"] == full and "output_from_cli_session" not in c
