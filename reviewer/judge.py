@@ -28,7 +28,7 @@ from reviewer.judge_inputs import (MAX_OUTPUT_CHARS, RunView, build_run_view, re
 from reviewer.llm import LLMClient, extract_json_object
 from reviewer.rubric import Criterion, load_criteria, missing_inputs
 
-JUDGE_VERSION = 2
+JUDGE_VERSION = "2.1"   # 2.1: long tool outputs shown as finding-matched excerpts (D-60)
 BACKENDS = {"anthropic": ("claude-haiku-4-5", "ANTHROPIC_API_KEY"),
             "google": ("gemini-2.5-flash", "GOOGLE_API_KEY")}
 # Gemini 2.5 Flash counts its thinking tokens against the output limit: at 8,192 a long reasoning

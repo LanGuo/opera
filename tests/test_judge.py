@@ -272,7 +272,7 @@ def test_review_page_shows_the_judge_inputs_and_results(run, monkeypatch, capsys
     review.main()
     page = sorted(run.glob("review_*.html"))[-1].read_text()
     assert "What the evidence judge reads" in page and "What the reasoning judge reads" in page
-    assert "Judge results (v2)" in page
+    assert "Judge results (v2.1)" in page
     assert page.index("What the evidence judge reads") < page.index("locked-section")
     assert page.index("What the reasoning judge reads") > page.index("locked-section")
 
@@ -297,3 +297,21 @@ def test_responses_parsed_from_bare_lists_and_bad_json_retried(run):
     assert "error" not in first and len(first["unparsed_responses"]) == 1
     assert all(v["status"] in ("scored", "not_assessable") for v in next(iter(res["per_hypothesis"].values())).values())
     assert any(v["status"] == "scored" for v in next(iter(res["per_hypothesis"].values())).values())
+
+
+def test_long_output_excerpt_shows_the_passage_with_the_items_values():
+    """D-60: past the start, the judges see where the item's numbers and symbols occur."""
+    from reviewer.judge_inputs import excerpt
+    warnings = "Warning: transforming to str index\n" * 100
+    table = "".join(f"GENE{i}: logFC=+0.{i:03d}\n" for i in range(200))
+    out = warnings + table + "IRF7: SLE=4.043 vs normal=2.451, logFC=+1.592\n" + table
+    x = excerpt(out, 2000, "IRF7 logFC=+1.592 (SLE=4.043 vs 2.451)")
+    assert "IRF7: SLE=4.043 vs normal=2.451, logFC=+1.592" in x
+    assert x.startswith("[excerpt of") and "not shown" in x and len(x) < 2300
+    assert out.startswith(x.split("\n", 1)[1][:400])                     # the start is kept
+    assert excerpt("short output", 2000, "IRF7 1.592") == "short output"
+    # a fraction written as a percentage, and a symbol with a weak number
+    out2 = warnings + "row SSB classical monocyte pct 0.112 p 0.0\n" + "x 0.0\n" * 500
+    assert "SSB classical monocyte pct 0.112" in excerpt(out2, 2000, "SSB up in monocytes, 11.2% of cells")
+    # nothing matched past the start: cut at the budget, as before
+    assert excerpt(warnings * 2, 2000, "IRF7 1.592").endswith("[output cut at 2,000 of 7,000 characters]")

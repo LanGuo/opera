@@ -1,9 +1,12 @@
 """Judge inputs, selected and formatted from ledger.jsonl fields only (judging-v2 §4.1).
 
-Nothing here infers, matches, summarises or rewords: each renderer prints named fields of named
-entry kinds in ledger order, with one fixed template for every agent. The only change to any value
-is the per-output budget: a cited tool output longer than `max_output_chars` is cut and the cut is
-marked. Which pass reads which field:
+Nothing here infers, summarises or rewords: each renderer prints named fields of named entry kinds
+in ledger order, with one fixed template for every agent. The only change to any value is the
+per-output budget. A cited tool output longer than `max_output_chars` is shown as an excerpt: its
+start, then the passages where the evidence item's own numbers and identifiers occur (matched as
+the ledger's source linking matches them, D-60), each marked with its character positions and the
+gaps marked as not shown. With no match past the start, the output is cut at the budget and the
+cut is marked. Which pass reads which field:
 
 - evidence pass (E): hypothesis text and attributes; every evidence item the hypothesis ever cited
   (withdrawn ones marked) with the cited calls' arguments, output and error; latest open
@@ -22,13 +25,111 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from hypothesis_ledger.ledger import Ledger
+import re
+
+from hypothesis_ledger.ledger import _IDENTIFIER, _NUMBER, _OUTPUT_NUMBER, Ledger, _parse_number
 
 MAX_OUTPUT_CHARS = 2000
 UNCITED_OUTPUT_CHARS = 200
 NO_SOURCE = "no recorded source"
 RUN_PLAN_KEY = "run"   # conclusion.validation key of runs converted from v1
 RUN_PLAN_NOTE = "(one plan for the whole run, not written for this hypothesis) "
+
+
+EXCERPT_HEAD = 400      # characters of an output's start always shown
+EXCERPT_BEFORE = 150    # characters shown before a matched value (a label usually precedes it)
+EXCERPT_AFTER = 450     # and after it
+_SYMBOL = re.compile(r"(?<![A-Za-z0-9])[A-Z][A-Z0-9]{2,9}(?![A-Za-z0-9])")   # gene-like: MAN2A1, SSB
+_COMMON_CAPS = {"SLE", "GWAS", "PBMC", "PBMCS", "DNA", "RNA", "AUC", "IFN", "ISG", "ISGS", "DEG",
+                "DEGS", "LOG", "THE", "AND", "NOT", "FDR", "CI", "OR"}
+
+
+def _targets(finding: str, quantities) -> tuple[list[tuple[float, float]], list[str]]:
+    """The item's numbers (value, half a unit in the last written place) and identifiers."""
+    texts = _NUMBER.findall(finding or "")
+    for q in quantities or []:
+        if isinstance(q, dict) and isinstance(q.get("value"), (int, float)) and not isinstance(q["value"], bool):
+            texts.append(repr(float(q["value"])) if isinstance(q["value"], float) else str(q["value"]))
+    nums = []
+    for t in texts:
+        v, tol = _parse_number(t)
+        if tol > 0 and (v, tol) not in nums:
+            nums.append((v, tol))
+    symbols = {w for w in _SYMBOL.findall(finding or "") if w not in _COMMON_CAPS}
+    return nums, sorted({i for i in _IDENTIFIER.findall(finding or "")} | symbols)
+
+
+def _matches(x: float, v: float, tol: float) -> bool:
+    eps = tol * 1e-9
+    for y in (x, x * 100):                       # a fraction the agent wrote as a percentage
+        if abs(y - v) <= tol + eps or ((y >= 0) == (v >= 0) and 0 <= abs(y) - abs(v) < 2 * tol + eps):
+            return True
+    return False
+
+
+def excerpt(text: str | None, limit: int, finding: str = "", quantities=None) -> str:
+    """`text` within `limit` characters: whole if it fits; else its start plus the passages that
+    contain the evidence item's numbers and identifiers, chosen greedily by how many not-yet-shown
+    values each adds; else (nothing matched past the start) cut at the limit."""
+    text = "" if text is None else str(text)
+    if not limit or len(text) <= limit:
+        return text
+    nums, idents = _targets(finding, quantities)
+    hits: list[tuple[int, int]] = []               # (position, target index)
+    if nums:
+        for m in _OUTPUT_NUMBER.finditer(text):
+            try:
+                x = float(m.group())
+            except ValueError:
+                continue
+            hits += [(m.start(), k) for k, (v, tol) in enumerate(nums) if _matches(x, v, tol)]
+    for j, ident in enumerate(idents):
+        hits += [(m.start(), len(nums) + j) for m in
+                 re.finditer(r"(?<![A-Za-z0-9])" + re.escape(ident) + r"(?![A-Za-z0-9])", text, re.I)]
+    head = min(EXCERPT_HEAD, limit)
+    covered = {k for p, k in hits if p < head}
+    spans: list[tuple[int, int]] = []
+    budget = limit - head
+    while budget > 0:
+        best = None
+        for p, _ in hits:
+            if p < head or any(a <= p < b for a, b in spans):
+                continue
+            a, b = max(head, p - EXCERPT_BEFORE), min(len(text), p + EXCERPT_AFTER)
+            gain = len({k for q, k in hits if a <= q < b} - covered)
+            if gain and (best is None or gain > best[0]):
+                best = (gain, a, b)
+        if best is None:
+            break
+        _, a, b = best
+        b = min(b, a + budget)
+        spans.append((a, b))
+        covered |= {k for q, k in hits if a <= q < b}
+        budget -= b - a
+    if not spans:
+        return cut(text, limit)
+    spans.sort()
+    # Budget left over: shared out to extend each passage forward (values follow their labels).
+    if budget > 0:
+        extra = budget // len(spans)
+        spans = [(a, min(len(text), b + extra)) for a, b in spans]
+    merged = [list(spans[0])]
+    for a, b in spans[1:]:
+        if a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    parts = [f"[excerpt of {len(text):,} characters: the start and the passages containing this item's "
+             "values; the rest is not shown]", text[:head]]
+    last = head
+    for a, b in merged:
+        if a > last:
+            parts.append(f"[... characters {last:,}-{a:,} not shown ...]")
+        parts.append(text[max(a, last):b])
+        last = b
+    if last < len(text):
+        parts.append(f"[... characters {last:,}-{len(text):,} not shown ...]")
+    return "\n".join(parts)
 
 
 def cut(text: str | None, limit: int) -> str:
@@ -173,7 +274,8 @@ def _render_calls(run: RunView, ev: EvidenceView, max_chars: int) -> list[str]:
         if c.get("error"):
             out.append(f"    Error: {c['error']}")
         out.append("    Output:\n" + "\n".join("      " + line for line in
-                                              cut(c.get("output"), max_chars).splitlines() or [""]))
+                                              excerpt(c.get("output"), max_chars, ev.finding,
+                                                      ev.quantities).splitlines() or [""]))
     return out
 
 
