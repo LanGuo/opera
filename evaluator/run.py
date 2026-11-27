@@ -5,8 +5,11 @@
   python -m evaluator.run claude-sonnet-4-6 --profile matched --dry-run
 
 Load API keys first (e.g. `set -a; source .env; set +a`). See evaluator.harness for the profiles.
-The run directory gets transcript.jsonl, run_manifest.json, and the ledger written by the
-hypothesis-ledger server; reviewer.log_replay runs afterwards unless --skip-log-replay.
+The run directory gets ledger.jsonl, the run's only record: the launcher writes run_info entries
+(what ran, at the start; how it ended, at the end), every tool call and agent message as the CLI
+reports them, and every workspace file at the end; the agent writes hypotheses, notes and its
+conclusion through the hypothesis-ledger server. transcript.jsonl keeps the CLI's raw output as a
+backup. reviewer.log_replay runs afterwards unless --skip-log-replay.
 """
 from __future__ import annotations
 
@@ -24,6 +27,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from evaluator.harness import PROFILES, HarnessPlan, finish_run, plan_run, prepare_run, summarize_transcript
+from hypothesis_ledger.ledger import Ledger, artifact_entries
+from reviewer.log_replay import _parse_cost_details
 from reviewer.variability import code_version
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -77,7 +82,8 @@ def _stop_group(proc: subprocess.Popen) -> None:
     _signal_group(proc, signal.SIGKILL)
 
 
-def _run_cli(plan: HarnessPlan, env: dict, out, err, timeout_s: float | None) -> tuple[int, str | None]:
+def _run_cli(plan: HarnessPlan, env: dict, out, err, timeout_s: float | None,
+             on_poll=None) -> tuple[int, str | None]:
     """Run the CLI with its output going to `out`. Returns (exit code, why the launcher stopped it).
 
     The launcher stops it after `timeout_s`, or, when plan.stop_on_result, if it is still running
@@ -96,6 +102,8 @@ def _run_cli(plan: HarnessPlan, env: dict, out, err, timeout_s: float | None) ->
             time.sleep(POLL_S)
             pending += watch.read()
             *lines, pending = pending.split("\n")
+            if on_poll is not None:
+                on_poll()
             if plan.stop_on_result and result_seen_at is None and any(_is_result(l) for l in lines):
                 result_seen_at = time.monotonic()
             if timeout_s and time.monotonic() - started > timeout_s:
@@ -107,6 +115,15 @@ def _run_cli(plan: HarnessPlan, env: dict, out, err, timeout_s: float | None) ->
                 break
     _signal_group(proc, signal.SIGKILL)  # leftover MCP servers or shell commands
     return proc.wait(), (stopped[0] if stopped else None)
+
+
+def gemini_auth_from_google_key(harness: str, env: dict) -> None:
+    """Gemini CLI reads GEMINI_API_KEY; let a GOOGLE_API_KEY-only setup (our .env) work too.
+
+    Done here rather than in plan.env so the key never lands in the run_info entry.
+    """
+    if harness == "gemini" and not env.get("GEMINI_API_KEY") and env.get("GOOGLE_API_KEY"):
+        env["GEMINI_API_KEY"] = env["GOOGLE_API_KEY"]
 
 
 def _tmp_entries(tmp: Path) -> set[str]:
@@ -139,7 +156,7 @@ def execute(plan: HarnessPlan, *, task_dir, cli_version: str | None, environ: di
             timeout_s: float | None = None) -> dict:
     if (plan.run_dir / "transcript.jsonl").exists():
         raise FileExistsError(f"run directory already has a transcript: {plan.run_dir}")
-    task_text = (Path(task_dir) / "agent_task.md").read_text(encoding="utf-8")
+    task_text = plan.task_text or (Path(task_dir) / "agent_task.md").read_text(encoding="utf-8")
     prepare_run(plan)
     manifest = {
         "profile": plan.profile,
@@ -158,15 +175,20 @@ def execute(plan: HarnessPlan, *, task_dir, cli_version: str | None, environ: di
         **code_version(),
         "started_at": _now(),
     }
-    path = plan.run_dir / "run_manifest.json"
-    path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    ledger = Ledger(plan.run_dir)
+    if ledger.exists():
+        raise FileExistsError(f"run directory already has a ledger: {plan.run_dir}")
+    ledger.append([{"kind": "run_info", "phase": "start", **manifest, "task_text": task_text,
+                    "task_rules": plan.task_rules}], "harness")
 
     env = {k: v for k, v in (os.environ if environ is None else environ).items() if k not in plan.unset_env}
     env.update(plan.env)
+    gemini_auth_from_google_key(plan.harness, env)
     tmp_before = _tmp_entries(SHARED_TMP) if plan.sweep_tmp else set()
     with open(plan.run_dir / "transcript.jsonl", "w", encoding="utf-8") as out, \
          open(plan.run_dir / "harness_stderr.log", "w", encoding="utf-8") as err:
-        exit_code, stopped_by = _run_cli(plan, env, out, err, timeout_s)
+        exit_code, stopped_by = _run_cli(plan, env, out, err, timeout_s, on_poll=ledger.sync_stream)
+    ledger.sync_stream(final=True)
     finish_run(plan)
     if plan.sweep_tmp:
         manifest["tmp_sweep"] = sweep_tmp(SHARED_TMP, tmp_before, plan.run_dir / "transcript.jsonl",
@@ -177,13 +199,26 @@ def execute(plan: HarnessPlan, *, task_dir, cli_version: str | None, environ: di
             (l.split("=", 1)[1].strip() for l in cfg.read_text().splitlines()
              if l.split("=", 1)[0].strip() in ("version", "version_info")), None) if cfg.exists() else None
 
-    manifest.update(
-        finished_at=_now(),
-        exit_code=exit_code,
-        stopped_by_launcher=stopped_by,
-        outcome=summarize_transcript(plan.run_dir / "transcript.jsonl", plan.harness, plan.model),
-    )
-    path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    cost_usd, unpriced = _parse_cost_details(plan.run_dir / "transcript.jsonl")
+    end = {
+        "finished_at": _now(),
+        "exit_code": exit_code,
+        "stopped_by_launcher": stopped_by,
+        "outcome": summarize_transcript(plan.run_dir / "transcript.jsonl", plan.harness, plan.model),
+        "cost_usd": cost_usd,
+        "cost_unpriced_models": unpriced,
+        "concluded": ledger.conclusion() is not None,
+        **{k: manifest[k] for k in ("tmp_sweep", "python_version") if k in manifest},
+    }
+    if plan.profile == "matched":
+        skip = ("GEMINI.md", ".gemini")   # written by the harness, not the agent
+        ledger.append(artifact_entries(plan.cwd, skip=skip), "harness")
+        # Files the agent's tools wrote to the per-run TMPDIR, and /tmp files moved by the sweep.
+        for sub in ("tmp", "tmp_leftovers"):
+            ledger.append(artifact_entries(plan.run_dir / "harness" / sub, prefix=f"harness/{sub}/"),
+                          "harness")
+    ledger.append([{"kind": "run_info", "phase": "end", **end}], "harness")
+    manifest.update(end)
     return manifest
 
 
@@ -194,6 +229,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--max-turns", type=int, default=30)
     parser.add_argument("--gemini-max-session-turns", type=int, default=None,
                         help="matched Gemini runs only; default: --max-turns")
+    parser.add_argument("--turn-warning", type=int, default=5,
+                        help="matched runs only: tell the agent the turns left once this many or "
+                             "fewer remain; 0 for none, as in the Tier 2 runs (default: 5)")
     parser.add_argument("--task", default="sle_biomarker_discovery")
     parser.add_argument("--runs-root", default=os.environ.get("WORKSPACE_ROOT", str(Path.home() / "bioeval")) + "/runs")
     parser.add_argument("--run-id", default=None)
@@ -210,10 +248,10 @@ def main(argv: list[str] | None = None) -> None:
     plan = plan_run(
         profile=args.profile, model=args.model, max_turns=args.max_turns, task_dir=task_dir,
         run_dir=Path(args.runs_root) / run_id, repo_root=REPO_ROOT, environ=dict(os.environ),
-        gemini_max_session_turns=args.gemini_max_session_turns,
+        gemini_max_session_turns=args.gemini_max_session_turns, turn_warning=args.turn_warning,
     )
     if args.dry_run:
-        task_text = (task_dir / "agent_task.md").read_text(encoding="utf-8")
+        task_text = plan.task_text
         print(json.dumps({
             "run_dir": str(plan.run_dir), "cwd": str(plan.cwd), "env_set": plan.env,
             "argv": manifest_argv(plan, task_text), "files": sorted(str(p) for p in plan.files),

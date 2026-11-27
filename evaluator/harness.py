@@ -8,7 +8,9 @@ Two profiles:
   runs under --max-turns; Gemini gets the task as a user message with no turn cap.
 - "matched" runs each CLI as a fresh install would: an empty config home per CLI, a clean
   per-run working directory, only OPERA's two MCP servers, the task appended to each CLI's own
-  system prompt, the same "Begin the task." message, and a turn cap for both. Subagents are off
+  system prompt, the same "Begin the task." message, and a turn cap for both. With
+  --turn-warning N, both CLIs run evaluator/turn_budget.py after every tool call, which tells the
+  agent how many turns are left once N or fewer remain. Subagents are off
   in both CLIs, and so are Claude Code's background tasks, which can wake the agent after the
   cap and keep `claude -p` running. Each run gets its own Python environment and temp directory,
   so packages and files one agent leaves behind don't reach the next. The task spec, which holds
@@ -20,12 +22,18 @@ reported, which can differ from the model requested.
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from evaluator.tooluniverse_server import TOOLUNIVERSE_VERSION
+import yaml
+
+from evaluator.tooluniverse_server import EXTRA_ENV, EXTRA_PACKAGES, PYTHON as TOOLUNIVERSE_PYTHON, TOOLUNIVERSE_VERSION
+from evaluator.turn_budget import HOOK_EVENTS
+from hypothesis_ledger.instructions import ledger_instructions
+from hypothesis_ledger.ledger import task_rules_from_spec
 from reviewer.log_replay import gemini_response_count
 
 PROFILES = ("pilot", "matched")
@@ -37,9 +45,11 @@ TOOLUNIVERSE_KEYS = ("NCBI_API_KEY", "BIOGRID_API_KEY", "DISGENET_API_KEY", "NVI
 # Claude Code's init record lists the subagent tool as "Task"; the model calls it as "Agent".
 CLAUDE_SUBAGENT_TOOLS = ("Agent", "Task")
 GEMINI_SUBAGENT_TOOL = "invoke_agent"
+# Gemini CLI 0.68 added a narration-only tool the Tier 2 CLI (0.50) didn't have (D-39).
+GEMINI_EXCLUDED_TOOLS = (GEMINI_SUBAGENT_TOOL, "update_topic")
 # Python for each run's own environment. cellxgene-census's tiledbsoma doesn't build on 3.14.
 RUN_PYTHON = "3.12"
-# Pinned ToolUniverse, started through a wrapper that fixes compose tools wiping its registry.
+# Pinned ToolUniverse, started through a launcher that checks the version.
 TOOLUNIVERSE_SERVER = Path(__file__).resolve().parent / "tooluniverse_server.py"
 
 
@@ -62,6 +72,8 @@ class HarnessPlan:
     stop_on_result: bool = False
     venv: Path | None = None   # created with RUN_PYTHON before the run; first on the agent's PATH
     sweep_tmp: bool = False    # move files the agent left in the shared /tmp into the run dir
+    task_text: str = ""        # the prompt as delivered: agent_task.md + the ledger section
+    task_rules: dict = field(default_factory=dict)  # hypothesis attributes and constraints
 
 
 def harness_for(model: str) -> str:
@@ -75,27 +87,61 @@ def _mcp_servers(repo_root: Path, run_dir: Path, environ: dict, trust: bool) -> 
         "env": {"ALLOW_HUMAN_INPUT": "false", "EVAL_RUN_DIR": str(run_dir)},
     }
     # Reference keys by name so no secret is written into run artifacts; both CLIs expand ${VAR}.
-    tool_env = {"PYTHONIOENCODING": "utf-8"}
+    tool_env = {"PYTHONIOENCODING": "utf-8", **EXTRA_ENV}
     tool_env.update({k: "${%s}" % k for k in TOOLUNIVERSE_KEYS if environ.get(k)})
-    tools = {"command": "uvx", "args": ["--from", f"tooluniverse=={TOOLUNIVERSE_VERSION}", "python",
+    extras = [a for pkg in EXTRA_PACKAGES for a in ("--with", pkg)]
+    tools = {"command": "uvx", "args": ["--python", TOOLUNIVERSE_PYTHON, "--from",
+                                        f"tooluniverse=={TOOLUNIVERSE_VERSION}", *extras, "python",
                                         "-P", str(TOOLUNIVERSE_SERVER)], "env": tool_env}
     if trust:
         ledger["trust"] = tools["trust"] = True
     return {"hypothesis-ledger": ledger, "tooluniverse": tools}
 
 
+def delivered_task_text(task_dir, turn_budget: tuple[int, int] | None = None) -> str:
+    """agent_task.md followed by the ledger section generated from the task spec.
+
+    turn_budget (cap, warn_at) adds a line telling the agent its turn cap and when it is warned.
+    """
+    task_dir = Path(task_dir)
+    spec = task_dir / "task_spec.yaml"
+    spec_data = yaml.safe_load(spec.read_text(encoding="utf-8")) if spec.exists() else {}
+    text = (task_dir / "agent_task.md").read_text(encoding="utf-8").rstrip("\n")
+    return f"{text}\n\n{ledger_instructions(spec_data, turn_budget=turn_budget)}"
+
+
+def _turn_budget_hooks(harness: str, repo_root: Path, cap: int, warn_at: int) -> dict:
+    """CLI settings registering evaluator/turn_budget.py after every tool call."""
+    # The agent's shell sets VIRTUAL_ENV to the run's venv; unset it so uv doesn't warn that it
+    # differs from the project's on every tool call (Gemini CLI shows hook stderr).
+    cmd = shlex.join(["env", "-u", "VIRTUAL_ENV", "uv", "run", "--project", str(repo_root), "python", "-m",
+                      "evaluator.turn_budget", "--harness", harness, "--cap", str(cap),
+                      "--warn-at", str(warn_at)])
+    matcher = "*" if harness == "claude" else ".*"
+    return {"hooks": {HOOK_EVENTS[harness]: [{"matcher": matcher,
+                                              "hooks": [{"type": "command", "command": cmd}]}]}}
+
+
 def plan_run(
     *, profile: str, model: str, max_turns: int, task_dir, run_dir, repo_root, environ: dict,
-    gemini_max_session_turns: int | None = None,
+    gemini_max_session_turns: int | None = None, turn_warning: int = 0,
 ) -> HarnessPlan:
     if profile not in PROFILES:
         raise ValueError(f"unknown profile {profile!r}; choose from {PROFILES}")
     task_dir, run_dir, repo_root = Path(task_dir), Path(run_dir), Path(repo_root)
-    task_text = (task_dir / "agent_task.md").read_text(encoding="utf-8")
     spec = task_dir / "task_spec.yaml"
+    spec_data = yaml.safe_load(spec.read_text(encoding="utf-8")) if spec.exists() else {}
     spec_copy = {spec: run_dir / "task_spec.yaml"} if spec.exists() else {}
     harness = harness_for(model)
-    base = dict(profile=profile, harness=harness, model=model, run_dir=run_dir)
+    # The pilot runs had no turn-budget warning; matched runs get one when turn_warning > 0.
+    cap = max_turns if harness == "claude" else (gemini_max_session_turns or max_turns)
+    warn = turn_warning if profile == "matched" and turn_warning > 0 else 0
+    task_text = delivered_task_text(task_dir, turn_budget=(cap, warn) if warn else None)
+    hooks = _turn_budget_hooks(harness, repo_root, cap, warn) if warn else {}
+    warning_detail = (f"from {warn} turns before the cap, a hook adds the turns left to each tool "
+                      "result (evaluator/turn_budget.py)") if warn else "none"
+    base = dict(profile=profile, harness=harness, model=model, run_dir=run_dir, task_text=task_text,
+                task_rules=task_rules_from_spec(spec_data or {}))
 
     if profile == "pilot":
         task_bash = task_text.rstrip("\n")  # $(cat file) strips trailing newlines
@@ -128,8 +174,8 @@ def plan_run(
     isolation = dict(venv=venv, sweep_tmp=True)
     env_details = {"python_env": f"fresh venv (Python {RUN_PYTHON}) first on PATH, user site hidden",
                    "tmpdir": "per-run TMPDIR; new /tmp entries the agent named are moved into the run dir",
-                   "tooluniverse": f"{TOOLUNIVERSE_VERSION}, compose-tool registry fix "
-                                   "(evaluator/tooluniverse_server.py)"}
+                   "tooluniverse": f"{TOOLUNIVERSE_VERSION} (Python {TOOLUNIVERSE_PYTHON}, with "
+                                   f"{', '.join(EXTRA_PACKAGES)})"}
     if harness == "claude":
         home, task_file, mcp_file = hdir / "claude-home", hdir / "agent_task.md", hdir / "mcp.json"
         servers = _mcp_servers(repo_root, run_dir, environ, trust=False)
@@ -147,26 +193,27 @@ def plan_run(
                  # Claude Code gives its shell TMPDIR=<this>/claude-<uid> (default base /tmp,
                  # shared by every Claude Code session on the machine).
                  "CLAUDE_CODE_TMPDIR": str(tmp)},
-            files={task_file: task_text, mcp_file: json.dumps({"mcpServers": servers}, indent=2)},
+            files={task_file: task_text, mcp_file: json.dumps({"mcpServers": servers}, indent=2),
+                   **({home / "settings.json": json.dumps(hooks, indent=2)} if hooks else {})},
             dirs=[ws, home, tmp], copy_after_run=spec_copy, stop_on_result=True, **isolation,
             details={"task_delivery": "appended to the CLI's built-in system prompt "
                                       "(--append-system-prompt-file)",
                      "turn_cap": f"--max-turns {max_turns}",
+                     "turn_warning": warning_detail,
                      "subagents": "off (--disallowedTools " + " ".join(CLAUDE_SUBAGENT_TOOLS) + ")",
                      "background_tasks": "off (CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1)",
                      **env_details,
                      "isolation": "empty CLAUDE_CONFIG_DIR, clean workspace, --strict-mcp-config"},
         )
 
-    cap = gemini_max_session_turns or max_turns
     home = hdir / "gemini-home"
     servers = _mcp_servers(repo_root, run_dir, environ, trust=True)
     # experimental.enableAgents only gates user-defined agents; the built-in ones stay reachable
     # through invoke_agent unless the tool itself is excluded.
     # ToolUniverse saves large results under TMPDIR, outside the workspace, and Gemini CLI's file
     # tools refuse paths outside the workspace unless the directory is included (Claude's don't).
-    settings = {"model": {"maxSessionTurns": cap}, "tools": {"exclude": [GEMINI_SUBAGENT_TOOL]},
-                "context": {"includeDirectories": [str(tmp)]}, "mcpServers": servers}
+    settings = {"model": {"maxSessionTurns": cap}, "tools": {"exclude": list(GEMINI_EXCLUDED_TOOLS)},
+                "context": {"includeDirectories": [str(tmp)]}, "mcpServers": servers, **hooks}
     argv = ["gemini", "-p", USER_PROMPT, "--model", model, "--output-format", "stream-json",
             "--approval-mode", "yolo", "--skip-trust"]
     return HarnessPlan(
@@ -178,7 +225,9 @@ def plan_run(
         dirs=[ws, home, tmp], copy_after_run=spec_copy, stop_on_result=True, **isolation,
         details={"task_delivery": "appended to the CLI's built-in system prompt (workspace GEMINI.md)",
                  "turn_cap": f"model.maxSessionTurns {cap}",
+                 "turn_warning": warning_detail,
                  "subagents": f"off (tools.exclude {GEMINI_SUBAGENT_TOOL})",
+                 "narration_tool": "off (tools.exclude update_topic)",
                  "background_tasks": "on (background shell processes don't wake the agent; "
                                      "maxSessionTurns is a hard stop)",
                  **env_details,

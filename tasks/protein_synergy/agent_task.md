@@ -20,15 +20,15 @@ landscape, or similar deep mutational scanning data) using available tools.
 
 2. **The Journal:** Maintain a `journal.md` in your workspace. Every time you 
    perform EDA or "stare at the data," record your observations, hypotheses, 
-   and changing beliefs. Use `log_analysis_step` to summarize these entries.
+   and changing beliefs. Use `log_note` (kind `interpretation`) to summarize these entries.
 
 3. **Three Variations:** When visualizing synergy or distance correlations, 
    propose and implement at least **three distinct approaches** (e.g., 3D 
    structure mapping, distance-vs-synergy scatter plots, or heatmaps of pairs).
 
-4. **Hypothesis Ledger:** Call `write_hypothesis` whenever you form a new 
-   candidate rule for synergy. Call `update_hypothesis` with a rationale 
-   whenever new evidence (structural or functional) changes your confidence.
+4. **Hypothesis Ledger:** Record each candidate rule for synergy as a hypothesis,
+   and update it whenever new evidence (structural or functional) changes your
+   confidence (rules at the end of these instructions).
 
 5. **Reproducibility:** Your final analysis must include a standalone Python 
    script (e.g., `discovery_pipeline.py`) that can be executed via `bash` 
@@ -42,7 +42,7 @@ landscape, or similar deep mutational scanning data) using available tools.
   color scale. Use divergent scales ONLY for "delta," "synergy," or "relative" 
   properties.
 - **No Cherry-Picking:** If evidence contradicts your proximity hypothesis, 
-  you must update your ledger with `status: "weakened"` or `"refuted"`.
+  record it as contradicting evidence and mark the hypothesis `weakened` or `refuted`.
 
 ## Recommended Tools (via ToolUniverse)
 

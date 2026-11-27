@@ -1,7 +1,7 @@
 import json
 import pytest
 from pathlib import Path
-from hypothesis_ledger.workspace import Workspace
+from tests.v1_run import V1Workspace as Workspace
 from reviewer.log_replay import (analyze_run, RunMetrics, _parse_transcript,
                                   _bare_tool_name, _confidence_sequence,
                                   _martingale_score, _directional_flip_count)
@@ -394,3 +394,14 @@ def test_gemini_cost_prices_known_models_and_lists_unpriced(tmp_path):
     cost, unpriced = _parse_cost_details(p)
     assert cost == pytest.approx(1.25 + 1.0 + 0.5 + 3.0)
     assert unpriced == ["gemini-9-mystery"]
+
+
+def test_ledger_entropy_states_the_tool_count_it_used(populated_run, tmp_path, capsys):
+    from reviewer.log_replay import print_report
+    from tests.synthetic_run import write_synthetic_run
+    old = analyze_run(str(populated_run))
+    assert old.ledger_tool_count == 6               # runs recorded before ledger.jsonl
+    new = analyze_run(str(write_synthetic_run(tmp_path / "r", concluded=True)))
+    assert new.ledger_tool_count == 5               # ledger runs: the tools that write an entry
+    print_report(new)
+    assert "(normalized, 5 ops available)" in capsys.readouterr().out

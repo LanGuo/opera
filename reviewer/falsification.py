@@ -119,40 +119,38 @@ def _extract_e_values_from_text(evidence: list) -> float:
     """
     E = 1.0
     for item in evidence:
-        text = _evidence_text(item)
-        text_lower = text.lower()
-        p_match = _P_PATTERN.search(text)
-        pct_match = _PERCENT_PATTERN.search(text)
-        effect_match = _EFFECT_SIZE_PATTERN.search(text)
-        score_match = _INTERACTION_SCORE_PATTERN.search(text)
-        if p_match:
-            p = float(p_match.group(1))
-            if p < 0.001:
-                e = 10.0
-            elif p < 0.01:
-                e = 5.0
-            elif p < 0.05:
-                e = 2.0
-            elif p < 0.1:
-                e = 1.0
-            else:
-                e = 0.5
-        elif pct_match:
-            pct = float(pct_match.group(2))
-            e = 3.0 if pct >= 90 else 2.0 if pct >= 70 else 1.5
-        elif effect_match:
-            e = 2.0
-        elif score_match:
-            e = 1.5
-        elif _CONTRADICTING_PATTERN.search(text_lower):
-            e = 0.5
-        elif _SUPPORTING_PATTERN.search(text_lower):
-            e = 1.5
-        else:
-            e = 1.0
-        E *= min(e, 10.0)
+        E *= min(_e_for_text(_evidence_text(item)), 10.0)
         E = min(E, 100.0)
     return E
+
+
+def _e_for_p(p: float) -> float:
+    return 10.0 if p < 0.001 else 5.0 if p < 0.01 else 2.0 if p < 0.05 else 1.0 if p < 0.1 else 0.5
+
+
+def _e_for_text(text: str) -> float:
+    """One item's e-value from its text (the heuristic described in _extract_e_values_from_text)."""
+    text_lower = text.lower()
+    p_match = _P_PATTERN.search(text)
+    pct_match = _PERCENT_PATTERN.search(text)
+    effect_match = _EFFECT_SIZE_PATTERN.search(text)
+    score_match = _INTERACTION_SCORE_PATTERN.search(text)
+    if p_match:
+        e = _e_for_p(float(p_match.group(1)))
+    elif pct_match:
+        pct = float(pct_match.group(2))
+        e = 3.0 if pct >= 90 else 2.0 if pct >= 70 else 1.5
+    elif effect_match:
+        e = 2.0
+    elif score_match:
+        e = 1.5
+    elif _CONTRADICTING_PATTERN.search(text_lower):
+        e = 0.5
+    elif _SUPPORTING_PATTERN.search(text_lower):
+        e = 1.5
+    else:
+        e = 1.0
+    return e
 
 
 def _recompute_confidence_from_assessments(assessments: list) -> tuple[float, float]:
@@ -192,11 +190,17 @@ def assess_hypothesis(
         src = e.get("source", "?") if isinstance(e, dict) else "?"
         user += f"{i + 1}. [{src}] {text}\n"
 
+    e_product = _extract_e_values_from_text(evidence)
+    return _observe(h_id, agent_conf, system, user, e_product, client)
+
+
+def _observe(h_id: str, agent_conf, system: str, user: str, e_product: float,
+             client: LLMClient) -> FalsificationResult:
+    """Ask the observer, then check its confidence against the deterministic e-value product."""
     raw_text = client.chat([
         {"role": "system", "content": system},
         {"role": "user", "content": user},
     ])
-    e_product = _extract_e_values_from_text(evidence)
     e_value_conf = min(0.99, e_product / (1 + e_product))
     try:
         parsed = extract_json_object(raw_text)
@@ -296,22 +300,63 @@ def assess_hypothesis(
     )
 
 
+# Hypothesis statuses the observer does not assess (D-65).
+SKIPPED_STATUSES = ("refuted", "abandoned")
+
+
+_P_QUANTITY = re.compile(r"^(p|p[_ -]?val(ue)?|padj|p[_ -]?adj(usted)?|fdr|q[_ -]?val(ue)?)$", re.IGNORECASE)
+
+
+def _ledger_item_e(ev) -> float:
+    """An evidence item's e-value: a p-value in its `quantities` if it has one, else its text."""
+    q = ev.quantities
+    rows = q if isinstance(q, list) else [dict(name=k, value=v) for k, v in q.items()] if isinstance(q, dict) else []
+    for row in rows:
+        if isinstance(row, dict) and _P_QUANTITY.match(str(row.get("name", "")).strip()):
+            try:
+                return _e_for_p(float(row.get("value")))
+            except (TypeError, ValueError):
+                pass
+    return _e_for_text(ev.finding)
+
+
+def assess_ledger_hypothesis(run, hypothesis_id: str, client: LLMClient,
+                             prompt_variant: str = "original") -> FalsificationResult:
+    """Observer on a ledger.jsonl run: reads exactly the pass-E input (findings, withdrawn items
+    marked, cited tool outputs; no rationale, confidence or status), with no task-specific fields."""
+    from reviewer.judge_inputs import render_evidence_input
+    h = run.hypotheses[hypothesis_id]
+    user = render_evidence_input(run, hypothesis_id)
+    E = 1.0
+    for ev in h.evidence.values():
+        if ev.withdrawn_in is None:
+            E = min(E * min(_ledger_item_e(ev), 10.0), 100.0)
+    return _observe(hypothesis_id, h.final.confidence, observer_system(get_variant(prompt_variant)),
+                    user, E, client)
+
+
 def assess_terminal_hypotheses(
     run_dir: str, client: LLMClient | None = None, prompt_variant: str = "original",
 ) -> list[FalsificationResult]:
     """Assess all hypotheses with evidence at end of run.
 
     Includes terminal, active, and weakened hypotheses — any hypothesis the
-    agent accumulated evidence for. Refuted hypotheses are excluded as the
-    agent already rejected them. The observer's validity is independent of
+    agent accumulated evidence for. Refuted and abandoned hypotheses are excluded:
+    the agent rejected them, or dropped or replaced them (an abandoned hypothesis's
+    confidence is often set to 0, so comparing the observer with it says nothing; D-65). The observer's validity is independent of
     whether the agent formally called declare_done on a hypothesis.
     """
     from hypothesis_ledger.workspace import Workspace
     c = client or get_llm_client()
     ws = Workspace(run_dir)
+    if ws.is_ledger_run:
+        from reviewer.judge_inputs import build_run_view
+        run = build_run_view(run_dir)
+        return [assess_ledger_hypothesis(run, hid, c, prompt_variant) for hid, h in run.hypotheses.items()
+                if h.final.status not in SKIPPED_STATUSES and h.evidence]
     data = ws.read_ledger()
     to_assess = [
         h for h in data.get("hypotheses", {}).values()
-        if h.get("status") != "refuted" and evidence_for_judging(h)
+        if h.get("status") not in SKIPPED_STATUSES and evidence_for_judging(h)
     ]
     return [assess_hypothesis(h, c, prompt_variant) for h in to_assess]

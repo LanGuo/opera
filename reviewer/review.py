@@ -93,14 +93,7 @@ def build_review_data(run_dir: str, llm_scores=None) -> dict:
     metrics = analyze_run(run_dir)
     ledger = ws.read_ledger()
 
-    steps = []
-    if ws.step_log_path.exists():
-        for line in ws.step_log_path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                try:
-                    steps.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
+    steps = ws.read_step_log()
 
     hypotheses = sorted(
         ledger.get("hypotheses", {}).values(),
@@ -117,8 +110,8 @@ def build_review_data(run_dir: str, llm_scores=None) -> dict:
         "overall_raw_by_backend": None,
     }
     total_tool_calls = None
-    if ws.final_report_path.exists():
-        report = json.loads(ws.final_report_path.read_text(encoding="utf-8"))
+    report = ws.read_final_report()
+    if report is not None:
         locked["rationale"] = report.get("rationale")
         locked["confidence_summary"] = report.get("confidence_summary")
         locked["suggested_validation"] = report.get("suggested_validation")
@@ -625,7 +618,7 @@ def _render_section3(data: dict) -> str:
     return "".join(p)
 
 
-def _render_locked(data: dict, falsification_scores_html: str = "") -> str:
+def _render_locked(data: dict, falsification_scores_html: str = "", judge_v2_html: str = "") -> str:
     locked = data.get("locked", {})
 
     llm_scores = locked.get("llm_scores")
@@ -725,6 +718,8 @@ def _render_locked(data: dict, falsification_scores_html: str = "") -> str:
     conf = _esc(locked.get("confidence_summary") or "")
     validation = _esc(locked.get("suggested_validation") or "")
 
+    if judge_v2_html:   # ledger.jsonl run judged by reviewer.judge: replaces the v1 score block
+        scores_html = judge_v2_html
     content = (
         "<h3>LLM-as-Judge Scores</h3>" + scores_html
         + "<h3>Agent Rationale</h3>"
@@ -906,25 +901,35 @@ def _render_falsification_scores(results: list) -> str:
     )
 
 
+def _review_v2_css() -> str:
+    from reviewer.review_v2 import CSS
+    return CSS
+
+
 def render_html(
     data: dict,
     falsification_criteria_html: str = "",
     falsification_scores_html: str = "",
+    judge_inputs_html: str = "",
+    judge_v2_html: str = "",
 ) -> str:
+    """judge_inputs_html / judge_v2_html: ledger.jsonl runs only (reviewer.review_v2)."""
     return (
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
         '<meta charset="utf-8">\n'
         '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
         f'<title>BioAgent-Eval Review &mdash; {_esc(data["run_id"])}</title>\n'
-        f"<style>{_css()}</style>\n"
+        f"<style>{_css()}{_review_v2_css() if (judge_inputs_html or judge_v2_html) else ''}</style>\n"
         "</head>\n<body>\n"
         + _render_header(data)
         + _render_task_context(data)
         + _render_section1(data)
+        + judge_inputs_html
         + _render_section2(data)
         + falsification_criteria_html
         + _render_section3(data)
-        + _render_locked(data, falsification_scores_html=falsification_scores_html)
+        + _render_locked(data, falsification_scores_html=falsification_scores_html,
+                         judge_v2_html=judge_v2_html)
         + f"<script>{_js(data)}</script>\n"
         "</body>\n</html>"
     )
@@ -1039,6 +1044,10 @@ def generate_review_html(run_dir, metrics, scores=None, falsification_results=No
 # CLI
 # ---------------------------------------------------------------------------
 
+class _SkipV1(Exception):
+    """Ledger runs are judged by reviewer.judge, not the v1 scorer."""
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         print("Usage: python -m reviewer.review <run_dir>", file=sys.stderr)
@@ -1059,9 +1068,36 @@ def main() -> None:
         import traceback; traceback.print_exc()
         sys.exit(1)
 
-    print("\n[2/4] Running LLM-as-judge scoring (all configured backends) ...")
+    from hypothesis_ledger.workspace import Workspace
+    ledger_run = Workspace(run_dir).is_ledger_run
+    judge_inputs_html = judge_v2_html = ""
     llm_scores = None
+    if ledger_run:
+        print("\n[2/4] Judging v2 (reviewer.judge; ledger.jsonl run) ...")
+        try:
+            from reviewer.judge import configured_backends, judge_run, summary
+            from reviewer.review_v2 import (latest_judge_file, render_judge_inputs,
+                                            render_judge_results)
+            path = latest_judge_file(run_dir)
+            if path is None and configured_backends():
+                out = judge_run(run_dir)
+                print(summary(out))
+                path = Path(out["path"])
+            elif path is not None:
+                print(f"  Using {path.name} (delete it, or run bioagent-judge, to judge again).")
+            else:
+                print("  SKIP: no API keys found (ANTHROPIC_API_KEY / GOOGLE_API_KEY).")
+            judge_inputs_html = render_judge_inputs(run_dir, "evidence")
+            judge_v2_html = render_judge_inputs(run_dir, "reasoning") + (
+                render_judge_results(path) if path else "<p><em>Not judged yet.</em></p>")
+        except Exception as exc:
+            print(f"  ERROR: judging failed — locked section will show N/A.\n  Reason: {exc}", file=sys.stderr)
+            import traceback; traceback.print_exc()
+    else:
+        print("\n[2/4] Running LLM-as-judge scoring (all configured backends) ...")
     try:
+        if ledger_run:
+            raise _SkipV1()
         from reviewer.score import score_run_all_backends
         import os
         backends = []
@@ -1076,6 +1112,8 @@ def main() -> None:
             llm_scores = result or None
             n = sum(len(rs.hypothesis_scores) for rs in (result.values() if isinstance(result, dict) else [result])) if llm_scores else 0
             print(f"  Done: scored across {len(backends)} backend(s).")
+    except _SkipV1:
+        pass
     except Exception as exc:
         print(f"  ERROR: LLM scoring failed — locked section will show N/A.\n  Reason: {exc}", file=sys.stderr)
         import traceback; traceback.print_exc()
@@ -1102,6 +1140,7 @@ def main() -> None:
         data,
         falsification_criteria_html=_render_falsification_criteria(falsification_results or []),
         falsification_scores_html=_render_falsification_scores(falsification_results or []),
+        judge_inputs_html=judge_inputs_html, judge_v2_html=judge_v2_html,
     )
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     out = Path(run_dir) / f"review_{timestamp}.html"

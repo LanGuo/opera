@@ -2,7 +2,7 @@ import json
 import pytest
 import yaml
 
-from hypothesis_ledger.workspace import Workspace
+from tests.v1_run import V1Workspace as Workspace
 from reviewer.llm import MockLLMClient
 from reviewer.variability import (
     RecordingClient, run_repeats, summarize, load_records, load_human_scores, _numeric, _ordering,

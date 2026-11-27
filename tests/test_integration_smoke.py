@@ -1,92 +1,68 @@
-# tests/test_integration_smoke.py
+"""Integration smoke test: the hypothesis-ledger server over the MCP stdio protocol.
+
+Starts `python -m hypothesis_ledger.server` as a subprocess, calls every writing tool through an
+MCP client, and checks what lands in ledger.jsonl.
 """
-Integration smoke test: runs the hypothesis ledger server as a subprocess
-and verifies all 6 tools work over the MCP stdio protocol.
-Requires: `uv run python -m hypothesis_ledger.server` to be runnable.
-"""
+import asyncio
 import json
 import os
-import subprocess
 import sys
-import time
+
 import pytest
+
+from hypothesis_ledger.ledger import Ledger
 
 pytestmark = pytest.mark.integration
 
 
-@pytest.fixture(scope="module")
-def run_dir(tmp_path_factory):
-    return str(tmp_path_factory.mktemp("smoke_run"))
+async def _session_calls(run_dir: str):
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    params = StdioServerParameters(command=sys.executable, args=["-m", "hypothesis_ledger.server"],
+                                   env={**os.environ, "EVAL_RUN_DIR": run_dir, "ALLOW_HUMAN_INPUT": "false"})
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            names = {t.name for t in (await session.list_tools()).tools}
+
+            async def call(name, **args):
+                r = await session.call_tool(name, args)
+                return json.loads(r.content[0].text)
+
+            out = {"tools": names}
+            out["write"] = await call(
+                "write_hypothesis", hypothesis="SIGLEC1 is raised on SLE monocytes",
+                attributes={"gene": "SIGLEC1", "cell_type": "monocytes"}, confidence=0.6,
+                evidence=[{"finding": "lfc 2.1, padj 1e-8", "source": {"tool": "Bash", "match": "deg"},
+                           "relation": "supports"}],
+                rationale="Large effect in the starting cohort")
+            out["update"] = await call(
+                "update_hypothesis", hypothesis_id="H1", confidence=0.75, status="supported",
+                evidence=[{"ref": "E1", "relation": "supports"},
+                          {"finding": "IFN signature GWAS locus", "source": {"citation": "PMID 1"},
+                           "relation": "supports"}],
+                rationale="Second modality")
+            out["note"] = await call("log_note", kind="interpretation", text="IFN-driven", hypothesis_ids=["H1"])
+            out["human"] = await call("request_human_input", question="Valid?", context="ctx")
+            out["read"] = await call("read_hypotheses", status_filter="all")
+            out["done"] = await call("declare_done", ranked_hypothesis_ids=["H1"], rationale="converged",
+                                     confidence_summary="0.75", validation={"H1": "flow cytometry"})
+            return out
 
 
-def test_server_starts_and_all_tools_callable(run_dir):
-    """Verify the server registers all 6 tools via `mcp dev` list-tools inspection."""
-    env = {**os.environ, "EVAL_RUN_DIR": run_dir, "ALLOW_HUMAN_INPUT": "false"}
-    result = subprocess.run(
-        ["uv", "run", "python", "-c",
-         "from hypothesis_ledger.server import mcp; "
-         "tools = [t.name for t in mcp._tool_manager.list_tools()]; "
-         "print(tools)"],
-        capture_output=True, text=True, env=env, timeout=15
-    )
-    assert result.returncode == 0, result.stderr
-    tools = eval(result.stdout.strip())
-    expected = {
-        "write_hypothesis", "read_hypotheses", "update_hypothesis",
-        "log_analysis_step", "declare_done", "request_human_input",
-    }
-    assert expected == set(tools), f"Missing tools: {expected - set(tools)}"
-
-
-def test_full_mini_workflow(run_dir):
-    """Call all 6 tools in sequence; verify workspace state is correct."""
-    env = {**os.environ, "EVAL_RUN_DIR": run_dir, "ALLOW_HUMAN_INPUT": "false"}
-
-    script = """
-import json, sys, os
-sys.path.insert(0, '.')
-os.environ['EVAL_RUN_DIR'] = sys.argv[1]
-from hypothesis_ledger import server as srv
-
-# write
-r = json.loads(srv._tool_write_hypothesis(
-    cell_type='pDC', candidate_gene='SIGLEC1', claim='elevated in SLE',
-    evidence=[{'source': 'DEG', 'strength': 'strong', 'log2fc': 2.1}],
-    confidence=0.65, open_questions=['Is it druggable?']
-))
-h_id = r['hypothesis_id']
-
-# log step
-srv._tool_log_analysis_step(
-    step_type='DEG', tool_used='scanpy', inputs_summary='SLE vs ctrl pDC',
-    outputs_summary='SIGLEC1 top hit', interpretation='strong candidate',
-    next_action='check GWAS'
-)
-
-# update
-srv._tool_update_hypothesis(h_id, {'confidence': 0.82}, 'GWAS colocalization found')
-
-# read
-r2 = json.loads(srv._tool_read_hypotheses('active'))
-assert r2['filtered_count'] == 1
-assert r2['hypotheses'][h_id]['confidence'] == 0.82
-
-# request human (headless)
-r3 = json.loads(srv._tool_request_human_input('Valid?', 'SLE context'))
-assert r3['status'] == 'headless_mode'
-
-# declare done
-r4 = json.loads(srv._tool_declare_done(
-    top_hypotheses=[h_id], rationale='converged',
-    confidence_summary='0.82', suggested_validation='flow cytometry'
-))
-assert r4['status'] == 'completed'
-print('PASS')
-"""
-
-    result = subprocess.run(
-        ["uv", "run", "python", "-c", script, run_dir],
-        capture_output=True, text=True, env=env, timeout=30
-    )
-    assert result.returncode == 0, result.stderr
-    assert "PASS" in result.stdout
+def test_ledger_server_over_stdio(tmp_path):
+    Ledger(tmp_path).append([{"kind": "run_info", "phase": "start", "task_rules": {
+        "hypothesis_attributes": [{"name": "gene"}, {"name": "cell_type"}],
+        "hypothesis_constraints": [{"unique": ["gene"]}]}}], "harness")
+    out = asyncio.run(_session_calls(str(tmp_path)))
+    assert "log_analysis_step" not in out["tools"] and "log_note" in out["tools"]
+    assert out["write"]["status"] == "recorded" and out["write"]["hypothesis_id"] == "H1"
+    assert out["update"]["status"] == "recorded"
+    assert out["note"]["status"] == "recorded" and out["human"]["status"] == "headless_mode"
+    assert out["read"]["hypotheses"][0]["status"] == "supported"
+    assert out["done"]["status"] == "completed" and out["done"]["warnings"] == []
+    kinds = [e["kind"] for e in Ledger(tmp_path).entries()]
+    assert kinds == ["run_info", "hypothesis", "hypothesis", "note", "human_input", "conclusion"]
+    for f in ("ledger.json", "step_log.jsonl", "run_log.jsonl", "final_report.json"):
+        assert not (tmp_path / f).exists()

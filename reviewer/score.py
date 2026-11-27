@@ -409,8 +409,8 @@ def score_run(
     """
     v = get_variant(prompt_variant)
     ws = Workspace(run_dir)
-    completed = ws.final_report_path.exists()
-    report = json.loads(ws.final_report_path.read_text(encoding="utf-8")) if completed else {}
+    completed = ws.has_final_report()
+    report = ws.read_final_report() or {}
     task_spec = ws.read_task_spec()
 
     if client is None:

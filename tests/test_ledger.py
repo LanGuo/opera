@@ -1,0 +1,660 @@
+"""The run ledger (ledger.jsonl): recording, the agent's ledger tools, and readers."""
+import json
+import multiprocessing
+
+import pytest
+
+from hypothesis_ledger import server
+from hypothesis_ledger.instructions import ledger_instructions
+from hypothesis_ledger.ledger import (Ledger, StreamParser, artifact_entries, link_source,
+                                      split_tool_name)
+from hypothesis_ledger.workspace import Workspace
+
+SLE_RULES = {
+    "hypothesis_attributes": [{"name": "gene", "description": "HGNC symbol"},
+                              {"name": "cell_type", "description": "cell type(s)"}],
+    "hypothesis_constraints": [{"unique": ["gene"], "among": ["active", "supported", "weakened"]}],
+}
+
+
+def _w(path, records):
+    with open(path, "a") as f:
+        for r in records:
+            f.write((r if isinstance(r, str) else json.dumps(r)) + "\n")
+
+
+def claude_call(cid, name, args, output, is_error=False):
+    return [
+        {"type": "assistant", "message": {"id": "m" + cid, "content": [
+            {"type": "tool_use", "id": cid, "name": name, "input": args}]}},
+        {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": cid, "is_error": is_error,
+             "content": [{"type": "text", "text": output}]}]}},
+    ]
+
+
+@pytest.fixture
+def run(tmp_path):
+    """A run dir with a run_info start entry declaring the SLE rules, and the server pointed at it."""
+    led = Ledger(tmp_path)
+    led.append([{"kind": "run_info", "phase": "start", "task_rules": SLE_RULES}], "harness")
+    server._reset_for_tests(tmp_path)
+    return tmp_path
+
+
+def call(fn, *a, **kw):
+    return json.loads(fn(*a, **kw))
+
+
+def ev(finding, tool=None, match=None, relation="supports", **kw):
+    src = {}
+    if tool:
+        src["tool"] = tool
+    if match:
+        src["match"] = match
+    return {"finding": finding, "source": src, "relation": relation, **kw}
+
+
+# --- stream recording ---
+
+def test_split_tool_name_both_clis():
+    assert split_tool_name("mcp__tooluniverse__execute_tool") == ("tooluniverse", "execute_tool")
+    assert split_tool_name("mcp_hypothesis-ledger_write_hypothesis") == ("hypothesis-ledger", "write_hypothesis")
+    assert split_tool_name("Bash") == (None, "Bash")
+
+
+def test_claude_stream_records_calls_messages_and_skips_ledger_tools(tmp_path):
+    t = tmp_path / "transcript.jsonl"
+    _w(t, [{"type": "system", "subtype": "init"},
+           {"type": "assistant", "message": {"content": [{"type": "thinking", "thinking": "plan it"}]}},
+           {"type": "assistant", "message": {"content": [{"type": "text", "text": "Starting."}]}}])
+    _w(t, claude_call("t1", "mcp__tooluniverse__execute_tool",
+                      {"tool_name": "OpenTargets_x", "arguments": {"q": "GZMH"}}, "score 0.9"))
+    _w(t, claude_call("t2", "mcp__hypothesis-ledger__log_note", {"kind": "plan"}, "ok"))
+    _w(t, claude_call("t3", "Bash", {"command": "python deg.py"}, "boom", is_error=True))
+    led = Ledger(tmp_path)
+    assert led.sync_stream() == 4
+    calls = led.entries("tool_call")
+    assert [c["tool_call_id"] for c in calls] == ["T1", "T2"]
+    assert calls[0]["tool"] == "OpenTargets_x" and calls[0]["via"] == "execute_tool"
+    assert calls[0]["output"] == "score 0.9" and calls[0]["error"] is None
+    assert calls[1]["tool"] == "Bash" and calls[1]["error"]
+    msgs = led.entries("agent_message")
+    assert [(m["visibility"], m["text"]) for m in msgs] == [("thinking", "plan it"), ("visible", "Starting.")]
+    assert all(e["written_by"] == "harness" for e in calls + msgs)
+
+
+def test_gemini_stream_joins_text_and_keeps_error_type(tmp_path):
+    t = tmp_path / "transcript.jsonl"
+    _w(t, [{"type": "message", "role": "assistant", "content": "Hel", "delta": True},
+           {"type": "message", "role": "assistant", "content": "lo", "delta": True},
+           {"type": "tool_use", "tool_name": "run_shell_command", "tool_id": "g1",
+            "parameters": {"command": "ls"}, "timestamp": "t0"},
+           {"type": "tool_result", "tool_id": "g1", "status": "success", "output": "a b", "timestamp": "t1"},
+           {"type": "tool_use", "tool_name": "Nope", "tool_id": "g2", "parameters": {}},
+           {"type": "tool_result", "tool_id": "g2", "status": "error", "output": "not found",
+            "error": {"type": "tool_not_registered", "message": "Tool \"Nope\" not found"}}])
+    led = Ledger(tmp_path)
+    led.sync_stream()
+    assert [m["text"] for m in led.entries("agent_message")] == ["Hello"]
+    c1, c2 = led.entries("tool_call")
+    assert (c1["output"], c1["started"], c1["finished"]) == ("a b", "t0", "t1")
+    assert c2["error_type"] == "tool_not_registered"
+
+
+def test_tool_failures_reported_inside_the_output_are_errors(tmp_path):
+    t = tmp_path / "transcript.jsonl"
+    outs = ['{"status": "error", "error": "research_topic is required"}',
+            '{"success": false, "error": "summary unavailable"}',
+            '{"result": "{\\"status\\": \\"error\\"}"}',
+            '{"status": "success", "data": {"success": false}}',
+            'status error in plain text',
+            '{"success": false, "error": "no summary", "literature": {"articles": [1]}}']
+    for i, out in enumerate(outs):
+        _w(t, claude_call(f"t{i}", "mcp__tooluniverse__execute_tool", {"tool_name": "X"}, out))
+    led = Ledger(tmp_path)
+    led.sync_stream()
+    assert [bool(c["error"]) for c in led.entries("tool_call")] == [True, True, True, False, False, False]
+
+
+def test_partial_last_line_waits_and_unfinished_call_recorded_at_end(tmp_path):
+    t = tmp_path / "transcript.jsonl"
+    _w(t, claude_call("t1", "Bash", {"command": "ls"}, "x")[:1])
+    with open(t, "a") as f:
+        f.write('{"type": "assist')          # being written
+    led = Ledger(tmp_path)
+    assert led.sync_stream() == 0           # no result yet, partial line ignored
+    assert led.sync_stream(final=True) == 1
+    [c] = led.entries("tool_call")
+    assert c["output"] is None and "run ended" in c["error"]
+
+
+def test_two_writers_never_record_a_call_twice(tmp_path):
+    t = tmp_path / "transcript.jsonl"
+    _w(t, claude_call("t1", "Bash", {"command": "a"}, "1"))
+    harness, ledger_server = Ledger(tmp_path), Ledger(tmp_path)
+    harness.sync_stream()
+    _w(t, claude_call("t2", "Bash", {"command": "b"}, "2"))
+    ledger_server.sync_stream()
+    harness.sync_stream()
+    assert [c["cli_call_id"] for c in Ledger(tmp_path).entries("tool_call")] == ["t1", "t2"]
+    assert [c["tool_call_id"] for c in Ledger(tmp_path).entries("tool_call")] == ["T1", "T2"]
+
+
+def _append_many(run_dir, n, tag):
+    led = Ledger(run_dir)
+    for i in range(n):
+        led.append([{"kind": "note", "note_kind": "other", "text": f"{tag}{i}"}], "agent")
+
+
+def test_concurrent_appends_from_processes_keep_ids_unique(tmp_path):
+    procs = [multiprocessing.Process(target=_append_many, args=(tmp_path, 40, t)) for t in "ab"]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join()
+    entries = Ledger(tmp_path).entries()
+    assert len(entries) == 80
+    assert len({e["entry_id"] for e in entries}) == 80
+
+
+# --- hypothesis entries ---
+
+HYP_FIELDS = {"entry_id", "time", "kind", "written_by", "hypothesis_id", "action", "hypothesis",
+              "attributes", "derived_from", "confidence", "status", "evidence",
+              "evidence_withdrawn", "rationale", "open_questions"}
+
+
+def test_create_and_update_entries_have_the_same_fields(run):
+    _w(run / "transcript.jsonl", claude_call("t1", "Bash", {"command": "python deg.py GZMH"}, "lfc 2.1"))
+    r = call(server._tool_write_hypothesis, "GZMH marks expanded CD8 clones",
+             {"gene": "GZMH", "cell_type": "CD8 T"}, 0.6,
+             [ev("GZMH lfc 2.1 in CD8", tool="Bash", match="GZMH")], "Strong DE, one modality")
+    assert r["status"] == "recorded" and r["hypothesis_id"] == "H1"
+    assert r["evidence"] == [{"evidence_id": "E1", "link": "exact", "tool_call_ids": ["T1"]}]
+    r2 = call(server._tool_update_hypothesis, "H1", 0.7, "supported",
+              [{"ref": "E1", "relation": "supports"}, ev("GWAS hit", citation_note=1)],
+              "Second modality")
+    assert r2["status"] == "recorded"
+    create, update = Ledger(run).entries("hypothesis")
+    assert set(create) == HYP_FIELDS and set(update) == HYP_FIELDS
+    assert update["hypothesis"] == create["hypothesis"] and update["attributes"] == create["attributes"]
+    assert update["evidence"][0] == {"ref": "E1", "relation": "supports"}
+    assert update["evidence"][1]["evidence_id"] == "E2" and update["evidence"][1]["link"] == "none"
+    assert update["evidence"][1]["extra"] == {"citation_note": 1}
+
+
+def test_update_has_no_way_to_change_hypothesis_text():
+    import inspect
+    params = inspect.signature(server.update_hypothesis).parameters
+    assert "hypothesis" not in params and "attributes" not in params and "updates" not in params
+
+
+@pytest.mark.parametrize("kwargs, msg", [
+    ({"evidence": []}, "evidence is required"),
+    ({"rationale": "  "}, "rationale is required"),
+    ({"confidence": 1.5}, "between 0 and 1"),
+    ({"attributes": {"gene": "X"}}, "missing required attribute"),
+    ({"attributes": {"gene": "X", "cell_type": "B", "tissue": "y"}}, "unknown attribute"),
+    ({"evidence": [{"finding": "x", "source": {}}]}, "relation must be one of"),
+    ({"evidence": [{"source": {}, "relation": "supports"}]}, "'finding'"),
+    ({"evidence": [{"ref": "E9", "relation": "supports"}]}, "no evidence 'E9'"),
+])
+def test_write_hypothesis_rejects_with_fixable_message(run, kwargs, msg):
+    args = dict(hypothesis="h", attributes={"gene": "X", "cell_type": "B"}, confidence=0.5,
+                evidence=[ev("f")], rationale="r")
+    args.update(kwargs)
+    r = call(server._tool_write_hypothesis, **args)
+    assert r["status"] == "rejected" and msg in r["error"]
+    assert Ledger(run).entries("hypothesis") == []
+
+
+def test_update_validation(run):
+    call(server._tool_write_hypothesis, "h", {"gene": "X", "cell_type": "B"}, 0.5, [ev("f")], "r")
+    bad = [("H9", 0.5, "active", [ev("f")], "r", None, "no hypothesis 'H9'"),
+           ("H1", 0.5, "terminal", [ev("f")], "r", None, "status must be one of"),
+           ("H1", 0.5, "active", [], "r", None, "evidence is required"),
+           ("H1", 0.5, "active", [ev("f")], "r", ["E7"], "never cited")]
+    for hid, c, st, e, why, wd, msg in bad:
+        r = call(server._tool_update_hypothesis, hid, c, st, e, why, wd)
+        assert r["status"] == "rejected" and msg in r["error"], msg
+    ok = call(server._tool_update_hypothesis, "H1", 0.2, "weakened",
+              [ev("contradicting result", relation="contradicts")], "artefact", ["E1"])
+    assert ok["status"] == "recorded"
+    assert Ledger(run).entries("hypothesis")[-1]["evidence_withdrawn"] == ["E1"]
+
+
+def test_unique_gene_constraint_and_derived_from(run):
+    attrs = {"gene": "GZMH", "cell_type": "CD8 T"}
+    call(server._tool_write_hypothesis, "h1", attrs, 0.5, [ev("f")], "r")
+    r = call(server._tool_write_hypothesis, "h2", {"gene": "gzmh", "cell_type": "NK"}, 0.5, [ev("f")], "r")
+    assert r["status"] == "rejected" and "H1 is already" in r["error"] and "abandoned" in r["error"]
+    call(server._tool_update_hypothesis, "H1", 0.3, "abandoned", [{"ref": "E1", "relation": "context"}],
+         "re-scoping to NK cells")
+    r = call(server._tool_write_hypothesis, "h2", {"gene": "GZMH", "cell_type": "NK"}, 0.5,
+             [{"ref": "E1", "relation": "supports"}], "r", derived_from="H1")
+    assert r["status"] == "recorded" and r["hypothesis_id"] == "H2"
+    assert Ledger(run).entries("hypothesis")[-1]["derived_from"] == "H1"
+    # reviving H1 would break the rule again
+    r = call(server._tool_update_hypothesis, "H1", 0.5, "active", [{"ref": "E1", "relation": "supports"}], "r")
+    assert r["status"] == "rejected" and "H2 is already" in r["error"]
+
+
+def test_task_without_attributes_takes_only_text(tmp_path):
+    Ledger(tmp_path).append([{"kind": "run_info", "phase": "start",
+                              "task_rules": {"hypothesis_attributes": [], "hypothesis_constraints": []}}],
+                            "harness")
+    server._reset_for_tests(tmp_path)
+    assert call(server._tool_write_hypothesis, "h", {}, 0.5, [ev("f")], "r")["status"] == "recorded"
+    r = call(server._tool_write_hypothesis, "h", {"gene": "X"}, 0.5, [ev("f")], "r")
+    assert r["status"] == "rejected" and "declares no hypothesis attributes" in r["error"]
+
+
+def test_rules_fall_back_to_task_spec_in_run_dir(tmp_path):
+    (tmp_path / "task_spec.yaml").write_text("hypothesis_attributes:\n  - name: protein\n")
+    server._reset_for_tests(tmp_path)
+    r = call(server._tool_write_hypothesis, "h", {}, 0.5, [ev("f")], "r")
+    assert "missing required attribute(s) ['protein']" in r["error"]
+
+
+# --- evidence linking ---
+
+def test_link_source():
+    calls = [{"tool_call_id": "T1", "tool": "Bash", "cli_tool": "Bash", "arguments": {"command": "python a.py GZMH"}},
+             {"tool_call_id": "T2", "tool": "OT_x", "cli_tool": "mcp__tooluniverse__execute_tool",
+              "via": "execute_tool", "arguments": {"tool_name": "OT_x", "arguments": {"gene": "GZMH"}}},
+             {"tool_call_id": "T3", "tool": "Bash", "cli_tool": "Bash", "arguments": {"command": "python b.py"}}]
+    assert link_source({"tool": "bash", "match": "a.py"}, calls)[:2] == (["T1"], "exact")
+    assert link_source({"tool": "Bash"}, calls)[:2] == (["T3"], "probable")
+    assert link_source({"tool": "OT_x"}, calls)[:2] == (["T2"], "exact")
+    assert link_source({"tool": "execute_tool", "match": "gzmh"}, calls)[:2] == (["T2"], "exact")
+    assert link_source({"tool": "cellxgene", "match": "a.py"}, calls)[:2] == (["T1"], "exact")
+    assert link_source({"tool_call_ids": ["T3"]}, calls)[:2] == (["T3"], "exact")
+    assert link_source({"citation": "PMID 1"}, calls)[:2] == ([], "citation")
+    assert link_source({"tool": "nothing"}, calls)[:2] == ([], "none")
+    assert link_source({}, calls)[:2] == ([], "none")
+
+
+def test_link_drops_failed_calls_when_a_successful_one_is_left():
+    calls = [{"tool_call_id": "T1", "tool": "execute_tool", "cli_tool": "mcp__tooluniverse__execute_tool",
+              "arguments": {"name": "Workflow"}, "error": "tool reported an error"},
+             {"tool_call_id": "T2", "tool": "Workflow", "via": "execute_tool",
+              "arguments": {"tool_name": "Workflow"}}]
+    assert link_source({"tool": "execute_tool", "match": "Workflow"}, calls)[:3] == (["T2"], "exact", ["T2"])
+    assert link_source({"tool": "execute_tool", "match": "Workflow"}, calls[:1])[:2] == (["T1"], "exact")
+
+
+def test_numbers_override_match_words_that_point_at_the_wrong_call():
+    calls = [{"tool_call_id": "T1", "tool": "Bash", "arguments": {"command": "cat > deg.py; python deg.py"},
+              "output": "ModuleNotFoundError", "error": "tool reported an error"},
+             {"tool_call_id": "T2", "tool": "Bash", "arguments": {"command": "python3 - <<EOF ... EOF"},
+              "output": "IFIH1 pDC 0.093 cMono 0.152 B 0.206"}]
+    ids, link, _, signals = link_source({"tool": "Bash", "match": "deg.py"}, calls,
+                                        "IFIH1 log2FC pDC +0.093, monocyte +0.152, B cell +0.206")
+    assert (ids, link, signals) == (["T2"], "exact", ["tool", "numbers"])
+    # One shared number is not enough to override the words.
+    ids, _, _, signals = link_source({"tool": "Bash", "match": "deg.py"}, calls, "pDC 0.093")
+    assert ids == ["T1"] and "match" in signals
+    # Words that pick a call showing two of the numbers keep it, even if another shows more.
+    calls[0]["output"], calls[0]["error"] = "IFIH1 pDC 0.093 cMono 0.152", None
+    ids, _, _, signals = link_source({"tool": "Bash", "match": "deg.py"}, calls,
+                                     "IFIH1 log2FC pDC +0.093, monocyte +0.152, B cell +0.206")
+    assert ids == ["T1"] and signals == ["tool", "match", "numbers"]
+
+
+def test_agent_named_tool_call_ids_are_checked():
+    calls = [{"tool_call_id": "T13", "tool": "update_topic", "arguments": {}, "output": None,
+              "error": "Tool not found", "error_type": "tool_not_registered"},
+             {"tool_call_id": "T14", "tool": "find_tools", "arguments": {"query": "GWAS"}, "output": "tools"},
+             {"tool_call_id": "T15", "tool": "GWAS_x", "via": "execute_tool",
+              "arguments": {"gene_name": "STAT4"}, "output": "rs10168266 p 2e-48 beta 0.41"}]
+    finding = "rs10168266 in STAT4 (p-value 2e-48, beta 0.41)"
+    ids, link, _, signals = link_source({"tool_call_ids": ["T13"]}, calls, finding)   # failed call
+    assert (ids, link) == (["T15"], "exact") and signals == ["numbers", "tool_call_ids rejected: T13"]
+    ids, link, _, _ = link_source({"tool_call_ids": ["T14"]}, calls, finding)          # numbers absent
+    assert (ids, link) == (["T15"], "exact")
+    assert link_source({"tool_call_ids": ["T15"]}, calls, finding)[:2] == (["T15"], "exact")
+    assert link_source({"tool_call_ids": ["T14"]}, calls, "GWAS tools listed")[:2] == (["T14"], "exact")
+
+
+def test_identifiers_and_scientific_integers_link_and_check_named_ids():
+    # Gemini shake-down 5: three GWAS calls, ids named off by two.
+    calls = [{"tool_call_id": "T14", "tool": "find_tools", "arguments": {"query": "GWAS"}, "output": "GWAS tools"},
+             {"tool_call_id": "T15", "tool": "GWAS_x", "arguments": {"gene_name": "STAT4"},
+              "output": "GCST90270940 rs10168266 p_value 1e-160"},
+             {"tool_call_id": "T16", "tool": "GWAS_x", "arguments": {"gene_name": "PTPN22"},
+              "output": "GCST90270940 rs2476601 p_value 4e-98"},
+             {"tool_call_id": "T17", "tool": "GWAS_x", "arguments": {"gene_name": "IFIH1"},
+              "output": "GCST90999828 rs78456138 p_value 5e-8 GCST90270940"}]
+    f13 = "GWAS study (accession ID GCST90270940): SNP rs2476601 in PTPN22 (p-value = 4e-98)."
+    f14 = "GWAS study (accession ID GCST90999828): SNP rs78456138 in IFIH1 (p-value = 5e-8)."
+    assert link_source({"tool_call_ids": ["T14"]}, calls, f13)[:2] == (["T16"], "exact")
+    assert link_source({"tool_call_ids": ["T15"]}, calls, f14)[:2] == (["T17"], "exact")
+    assert link_source({"tool_call_ids": ["T16"]}, calls, f13)[:2] == (["T16"], "exact")
+    # one shared identifier alone is not enough
+    assert link_source({}, calls, "study GCST90270940 is large")[:2] == ([], "none")
+    from hypothesis_ledger.ledger import _NUMBER, _rounds_to
+    assert _NUMBER.findall("p = 1e-160, 5×10⁻⁸, n = 300, 0.41") == ["1e-160", "5×10⁻⁸", "0.41"]
+    assert _rounds_to("4e-98", {4.4e-98}) and not _rounds_to("4e-98", {5.1e-98})
+
+
+def test_unlinked_evidence_warns_the_agent(run):
+    r = call(server._tool_write_hypothesis, "h", {"gene": "X", "cell_type": "B"}, 0.5,
+             [ev("f", tool="Bash", match="nothing ran")], "r")
+    assert r["status"] == "recorded" and "no recorded source" in r["warnings"][0]
+
+
+def test_server_syncs_stream_before_linking(run):
+    # The call is only in the transcript (the harness hasn't polled yet).
+    _w(run / "transcript.jsonl", claude_call("t1", "Bash", {"command": "run deg"}, "out"))
+    r = call(server._tool_write_hypothesis, "h", {"gene": "X", "cell_type": "B"}, 0.5,
+             [ev("f", tool="Bash", match="deg")], "r")
+    assert r["evidence"][0]["link"] == "exact"
+
+
+def test_recent_tool_calls_lists_ids(run):
+    _w(run / "transcript.jsonl", claude_call("t1", "Bash", {"command": "ls"}, "out"))
+    [c] = json.loads(server._tool_recent_tool_calls(5))
+    assert c["tool_call_id"] == "T1" and c["tool"] == "Bash"
+    assert json.loads(server._tool_recent_tool_calls("3"))[0]["tool_call_id"] == "T1"
+    for bad in ("all", None):
+        r = json.loads(server._tool_recent_tool_calls(bad))
+        assert r["status"] == "rejected" and "whole number" in r["error"]
+
+
+# --- notes, human input, conclusion ---
+
+def test_note_human_input_and_conclusion(run):
+    call(server._tool_write_hypothesis, "h", {"gene": "X", "cell_type": "B"}, 0.5, [ev("f")], "r")
+    assert call(server._tool_log_note, "interpretation", "means X", ["H1"])["status"] == "recorded"
+    assert call(server._tool_log_note, "musing", "x")["status"] == "rejected"
+    assert call(server._tool_log_note, "plan", "x", ["H5"])["status"] == "rejected"
+    assert call(server._tool_request_human_input, "Q?", "ctx")["status"] == "headless_mode"
+    assert call(server._tool_declare_done, [], "r", "c", {})["status"] == "rejected"
+    assert call(server._tool_declare_done, ["H7"], "r", "c", {})["status"] == "rejected"
+    r = call(server._tool_declare_done, ["H1"], "best", "high", "one run-level plan")
+    assert r["status"] == "completed" and "one plan per hypothesis" in r["warnings"][0]
+    led = Ledger(run)
+    assert led.entries("note")[0]["hypothesis_ids"] == ["H1"]
+    assert led.entries("human_input")[0]["question"] == "Q?"
+    assert led.conclusion()["validation"] == {"run": "one run-level plan"}
+
+
+def test_registered_tools():
+    import asyncio
+    names = {t.name for t in asyncio.run(server.mcp.list_tools())}
+    assert names == {"write_hypothesis", "update_hypothesis", "read_hypotheses", "recent_tool_calls",
+                     "log_note", "request_human_input", "declare_done"}
+
+
+def test_read_hypotheses_shows_latest_state(run):
+    call(server._tool_write_hypothesis, "h", {"gene": "X", "cell_type": "B"}, 0.5, [ev("f")], "r")
+    call(server._tool_update_hypothesis, "H1", 0.1, "refuted", [ev("g", relation="contradicts")], "no")
+    assert json.loads(server._tool_read_hypotheses("live"))["hypotheses"] == []
+    [h] = json.loads(server._tool_read_hypotheses("all"))["hypotheses"]
+    assert h["status"] == "refuted" and h["evidence_ids"] == ["E1", "E2"] and h["entries"] == 2
+
+
+# --- prompt section ---
+
+def test_instructions_state_task_attributes_and_rule():
+    text = ledger_instructions({**SLE_RULES})
+    assert "`gene` (required): HGNC symbol" in text and "at most one hypothesis per `gene`" in text
+    assert "attributes={}" in ledger_instructions({})
+    assert "log_analysis_step" not in text
+
+
+# --- readers ---
+
+def test_workspace_view_and_metrics_for_a_ledger_run(run):
+    from reviewer.log_replay import analyze_run
+    _w(run / "transcript.jsonl", claude_call("t1", "mcp__tooluniverse__execute_tool",
+                                             {"tool_name": "OT_x", "arguments": {}}, "out"))
+    call(server._tool_write_hypothesis, "h", {"gene": "X", "cell_type": "B"}, 0.4,
+         [ev("f", tool="OT_x")], "first")
+    call(server._tool_update_hypothesis, "H1", 0.7, "active", [ev("g")], "more")
+    call(server._tool_log_note, "debug", "retry")
+    call(server._tool_declare_done, ["H1"], "best", "c", {"H1": "qPCR"})
+    ws = Workspace(run)
+    assert ws.is_ledger_run and not (run / "ledger.json").exists()
+    h = ws.read_ledger()["hypotheses"]["H1"]
+    assert h["candidate_gene"] == "X" and h["claim"] == "h" and h["status"] == "terminal"
+    assert [e["evidence_id"] for e in h["evidence"]] == ["E1", "E2"]
+    assert h["update_history"][0]["changes"]["from"]["confidence"] == 0.4
+    assert h["creation_rationale"] == "first"
+    report = ws.read_final_report()
+    assert report["suggested_validation"] == "H1: qPCR" and report["top_hypotheses"][0]["hypothesis_id"] == "H1"
+    assert ws.read_step_log()[0]["step_type"] == "debug"
+    m = analyze_run(str(run))
+    assert m.completed and m.hypothesis_count == 1 and m.belief_revision_count == 1
+    assert m.universe_tool_counts == {"OT_x": 1}
+    assert m.tool_diversity["write_hypothesis"] == 1 and m.tool_diversity["declare_done"] == 1
+    # Turns are model responses, not Claude Code's num_turns (47 for a run that finished in 30).
+    Ledger(run).append([{"kind": "run_info", "phase": "end",
+                         "outcome": {"model_responses": 30, "turns_total": 47}}], "harness")
+    assert analyze_run(str(run)).turn_count == 30
+
+
+def test_artifact_entries(tmp_path):
+    (tmp_path / "a.py").write_text("print(1)\n")
+    (tmp_path / "plot.png").write_bytes(b"\x89PNG\x00\xff")
+    (tmp_path / ".gemini").mkdir()
+    (tmp_path / ".gemini" / "settings.json").write_text("{}")
+    arts = {a["path"]: a for a in artifact_entries(tmp_path, skip=(".gemini",), prefix="ws/")}
+    assert set(arts) == {"ws/a.py", "ws/plot.png"}
+    assert arts["ws/a.py"]["content"] == "print(1)\n" and "content" not in arts["ws/plot.png"]
+    assert len(arts["ws/plot.png"]["sha256"]) == 64
+
+
+# --- old runs ---
+
+def test_convert_v1_run(tmp_path):
+    from hypothesis_ledger.legacy import convert_v1
+    old = tmp_path / "old"
+    old.mkdir()
+    (old / "ledger.json").write_text(json.dumps({"hypotheses": {"AB12": {
+        "hypothesis_id": "AB12", "cell_type": "Mono", "candidate_gene": "SIGLEC1", "claim": "new claim",
+        "evidence": [{"type": "lit", "description": "paper"}], "confidence": 0.8, "status": "terminal",
+        "open_questions": [], "created_at": "2026-01-01",
+        "update_history": [{"timestamp": "t1", "rationale": "DE found",
+                            "changes": {"from": {"confidence": 0.5, "claim": "old claim",
+                                                 "evidence": [{"type": "scRNA", "description": "lfc 3"}]},
+                                        "to": {"confidence": 0.8, "claim": "new claim",
+                                               "evidence": [{"type": "lit", "description": "paper"},
+                                                            {"modality": "GWAS", "finding": "rs1 p 1e-9",
+                                                             "source": "Bentham 2015 (PMID:1)",
+                                                             "strength": "strong"}]}}}]}}}))
+    (old / "step_log.jsonl").write_text(json.dumps({"step_type": "Debugging", "interpretation": "fixed"}) + "\n")
+    (old / "final_report.json").write_text(json.dumps({"top_hypotheses": [{"hypothesis_id": "AB12"}],
+                                                       "rationale": "done", "suggested_validation": "flow"}))
+    _w(old / "transcript.jsonl", claude_call("t1", "Bash", {"command": "ls"}, "x"))
+    out = tmp_path / "new"
+    convert_v1(old, out)
+    led = Ledger(out)
+    create, update = led.entries("hypothesis")
+    assert create["hypothesis"] == "old claim" and create["confidence"] == 0.5 and create["rationale"] == ""
+    assert create["attributes"] == {"gene": "SIGLEC1", "cell_type": "Mono"}
+    assert create["evidence"][0]["finding"] == "lfc 3" and create["evidence"][0]["link"] == "none"
+    assert update["rationale"] == "DE found" and update["v1_rewrites"] == {"claim": "new claim"}
+    assert update["evidence"][0]["finding"] == "paper"
+    gwas = update["evidence"][1]           # the agent's strength rating stays out of the finding
+    assert gwas["finding"] == "rs1 p 1e-9" and gwas["link"] == "citation"
+    assert gwas["source"] == {"v1_kind": "GWAS", "citation": "Bentham 2015 (PMID:1)"}
+    assert gwas["extra"]["v1_item"]["strength"] == "strong"
+    from reviewer.judge_inputs import RUN_PLAN_NOTE, build_run_view
+    from reviewer.rubric import load_criteria, missing_inputs
+    run = build_run_view(out)
+    assert run.validation_for("H1") == RUN_PLAN_NOTE + "flow"      # one plan for the whole run
+    design = load_criteria({"rubric": [{"id": "d", "pass": "evidence",
+                                        "inputs": ["validation_plan", "evidence"]}]})[0][0]
+    assert missing_inputs(design, run, "H1") == []
+    from hypothesis_ledger.legacy import V1_NO_SOURCE
+    from reviewer.judge_inputs import NO_SOURCE, _render_item
+    unsourced = create["evidence"][0]       # old tools took no source: say so, not "no recorded source"
+    assert unsourced["source"]["unrecorded_reason"] == V1_NO_SOURCE
+    text = "\n".join(_render_item(run, run.hypotheses["H1"].evidence[unsourced["evidence_id"]], 2000))
+    assert f"not recorded ({V1_NO_SOURCE})" in text and NO_SOURCE not in text
+    assert led.entries("note")[0]["note_kind"] == "debug"
+    assert led.conclusion()["ranked_hypothesis_ids"] == ["H1"]
+    assert len(led.entries("tool_call")) == 1
+    assert "creation entries have no rationale" in led.run_info("start")["conversion_limits"]
+    assert not (old / "ledger.jsonl").exists()     # the old run is left alone
+    h = Workspace(out).read_ledger()["hypotheses"]["H1"]
+    assert {e["evidence_id"] for e in h["evidence"]} == {"E1", "E2", "E3"}   # dropped item kept cited
+
+
+def test_numbers_match_rounded_or_truncated_values():
+    from hypothesis_ledger.ledger import _rounds_to
+    assert _rounds_to("1.37e-263", {1.3756595832559e-263})      # truncated (Gemini shake-down 4)
+    assert _rounds_to("1.38e-263", {1.3756595832559e-263})      # rounded
+    assert _rounds_to("0.226", {0.22600824})
+    assert _rounds_to("-0.116", {-0.116963}) and _rounds_to("-0.117", {-0.116963})
+    assert not _rounds_to("1.36e-263", {1.3756595832559e-263})
+    assert not _rounds_to("0.116", {-0.116963})                # sign must agree
+    assert not _rounds_to("2.0", {2.2})
+
+
+def test_link_uses_words_of_match_and_rounded_numbers():
+    calls = [
+        {"tool_call_id": "T1", "tool": "Bash", "cli_tool": "Bash",
+         "arguments": {"command": "cat > /tmp/deg.py << EOF\nDATASET_ID = \"218acb0f-9f2f\"\nEOF"},
+         "output": "IFI44L 2.871843 4.7e-14\nDNASE1L3 -0.116963 1.366398e-01"},
+        {"tool_call_id": "T2", "tool": "Bash", "cli_tool": "Bash",
+         "arguments": {"command": "cat > /tmp/pseudobulk.py"}, "output": "IFI44L 1.0 0.5"},
+        {"tool_call_id": "T3", "tool": "EWAS_x", "cli_tool": "mcp__tooluniverse__execute_tool",
+         "via": "execute_tool", "arguments": {"tool_name": "EWAS_x", "arguments": {"gene_symbol": "IFI44L"}},
+         "output": "rank 1"},
+    ]
+    # agent names a library, not the tool; words of match + rounded numbers find the call
+    ids, link, _, signals = link_source({"tool": "cellxgene_census.get_anndata", "match": "dataset_id=218acb0f"},
+                                        calls, "DNASE1L3 log2FC=-0.117, p=0.137")
+    assert (ids, link) == (["T1"], "exact") and signals == ["match", "numbers"]
+    # 'key=value' written by the agent vs JSON arguments
+    assert link_source({"tool": "EWAS_x", "match": "gene_symbol=IFI44L"}, calls)[:2] == (["T3"], "exact")
+    # numbers alone, among all calls
+    assert link_source({}, calls, "log2FC 2.87, p=4.7e-14")[:2] == (["T1"], "exact")
+    assert link_source({}, calls, "log2FC 2.87, p = 4.7×10⁻¹⁴")[:2] == (["T1"], "exact")
+    # a single number that appears nowhere links nothing
+    assert link_source({}, calls, "fold change 9.99")[:2] == ([], "none")
+    # with no other signal, one matching number is not enough (shake-down run 2, E19)
+    assert link_source({"citation": "PMID 1"}, calls, "log2FC=2.87 in a paper")[:2] == ([], "citation")
+    # but it narrows candidates once the tool matched
+    assert link_source({"tool": "Bash"}, calls, "log2FC=2.87")[:2] == (["T1"], "exact")
+
+
+def test_evidence_entry_records_link_signals(run):
+    _w(run / "transcript.jsonl", claude_call("t1", "Bash", {"command": "python deg.py"}, "lfc 2.1043 p 0.0312"))
+    call(server._tool_write_hypothesis, "h", {"gene": "X", "cell_type": "B"}, 0.5,
+         [ev("lfc 2.10, p 0.031", tool="Bash", match="deg.py")], "r")
+    item = Ledger(run).entries("hypothesis")[0]["evidence"][0]
+    assert item["link"] == "exact" and item["link_signals"] == ["tool", "match", "numbers"]
+
+
+def test_cli_persisted_output_recorded_in_full(tmp_path):
+    """Claude Code swaps a large result for a preview and a file path (batch 2, D-47); the ledger
+    keeps the whole result from the record's tool_use_result."""
+    preview = "<persisted-output>\nOutput too large (68KB). Full output saved to: /x/t.json\n\nPreview (first 2KB):\n[..."
+    full_mcp = "AUC=0.892 " * 5000
+    recs = claude_call("t1", "mcp__tooluniverse__execute_tool", {"tool_name": "Lit"}, preview)
+    recs[1]["tool_use_result"] = [{"type": "text", "text": full_mcp}]
+    bash = claude_call("t2", "Bash", {"command": "cat big"}, preview)
+    bash[1]["tool_use_result"] = {"stdout": "r=-0.406", "stderr": "", "interrupted": False,
+                                  "persistedOutputPath": "/x/b.txt"}
+    lost = claude_call("t3", "Bash", {"command": "cat big"}, preview)   # no tool_use_result: keep preview
+    small = claude_call("t4", "Bash", {"command": "ls"}, "a.txt")
+    small[1]["tool_use_result"] = {"stdout": "a.txt"}
+    _w(tmp_path / "transcript.jsonl", recs + bash + lost + small)
+    calls = {c["cli_call_id"]: c for c in StreamParser(tmp_path / "transcript.jsonl").read(final=True)
+             if c["kind"] == "tool_call"}
+    assert calls["t1"]["output"] == full_mcp and calls["t1"]["output_persisted_by_cli"] is True
+    assert calls["t2"]["output"] == "r=-0.406" and calls["t2"]["output_persisted_by_cli"]
+    assert calls["t3"]["output"] == preview and "output_persisted_by_cli" not in calls["t3"]
+    assert calls["t4"]["output"] == "a.txt" and "output_persisted_by_cli" not in calls["t4"]
+
+
+def test_cli_over_token_limit_result_read_from_saved_file(tmp_path):
+    """Over Claude Code's token limit an MCP result is replaced by a message naming the file it was
+    saved to (batch 1 redo, D-48); the ledger reads that file, but only from inside the run dir."""
+    saved = tmp_path / "harness" / "tool-results" / "mcp-execute_tool-1.txt"
+    saved.parent.mkdir(parents=True)
+    saved.write_text('{"target_symbol": "ISG15", "score": 0.8449555672064456}', encoding="utf-8")
+    outside = tmp_path.parent / f"{tmp_path.name}_outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+
+    def msg(p):
+        return (f"Error: result (100,000 characters across 1 line) exceeds maximum allowed tokens. "
+                f"Output has been saved to {p}.\nFormat: Plain text\n- For targeted searches ...")
+    recs = claude_call("t1", "mcp__tooluniverse__execute_tool", {"tool_name": "x"}, msg(saved))
+    recs[1]["tool_use_result"] = msg(saved)
+    out = claude_call("t2", "mcp__tooluniverse__execute_tool", {"tool_name": "x"}, msg(outside))
+    gone = claude_call("t3", "mcp__tooluniverse__execute_tool", {"tool_name": "x"}, msg(tmp_path / "no.txt"))
+    preview = f"<persisted-output>\nOutput too large (68KB). Full output saved to: {saved}\n\nPreview..."
+    pv = claude_call("t4", "Bash", {"command": "cat big"}, preview)        # no tool_use_result: file
+    _w(tmp_path / "transcript.jsonl", recs + out + gone + pv)
+    calls = {c["cli_call_id"]: c for c in StreamParser(tmp_path / "transcript.jsonl").read(final=True)
+             if c["kind"] == "tool_call"}
+    assert "0.8449555672064456" in calls["t1"]["output"] and calls["t1"]["output_persisted_by_cli"]
+    assert calls["t2"]["output"] == msg(outside) and "output_persisted_by_cli" not in calls["t2"]
+    assert "output_persisted_by_cli" not in calls["t3"]
+    assert "ISG15" in calls["t4"]["output"] and calls["t4"]["output_persisted_by_cli"]
+    outside.unlink()
+
+
+def _gemini_session(tmp_path, responses):
+    chats = tmp_path / "harness" / "gemini-home" / ".gemini" / "tmp" / "workspace" / "chats"
+    chats.mkdir(parents=True, exist_ok=True)
+    recs = [{"sessionId": "s", "kind": "main"}]
+    for cid, name, out in responses:
+        recs.append({"id": "m" + cid, "type": "gemini", "toolCalls": [
+            {"id": cid, "name": name, "resultDisplay": "shown",
+             "result": [{"functionResponse": {"id": cid, "name": name, "response": {"output": out}}}]}]})
+    (chats / "session-1.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+
+
+def test_gemini_summary_output_replaced_by_what_the_model_got(tmp_path):
+    """Gemini CLI streams only a display line for google_web_search; the ledger takes what the model
+    got from the CLI's session file (D-59), waiting for that file if needed."""
+    _w(tmp_path / "transcript.jsonl", [
+        {"type": "tool_use", "tool_name": "google_web_search", "tool_id": "w1", "parameters": {"query": "q"}},
+        {"type": "tool_result", "tool_id": "w1", "status": "success", "output": 'Search results for "q" returned.'},
+        {"type": "tool_use", "tool_name": "run_shell_command", "tool_id": "s1", "parameters": {"command": "ls"}},
+        {"type": "tool_result", "tool_id": "s1", "status": "success", "output": "a.txt b.txt"},
+        {"type": "tool_use", "tool_name": "write_file", "tool_id": "f1", "parameters": {"file_path": "x"}},
+        {"type": "tool_result", "tool_id": "f1", "status": "success"}])
+    others = [("s1", "run_shell_command", "Output: a.txt b.txt\nExit Code: 0"),
+              ("f1", "write_file", "Successfully wrote x")]
+    _gemini_session(tmp_path, others)
+    led = Ledger(tmp_path)
+    led.sync_stream()
+    assert {c["cli_call_id"] for c in led.entries("tool_call")} == {"s1", "f1"}   # w1 waits
+    _gemini_session(tmp_path, [("w1", "google_web_search", 'Web search results for "q":\nPerez 2022 '
+                                "profiled 1.2 million PBMCs.\n<hook_context>Turn budget: 4 turns left"
+                                "</hook_context>")] + others)
+    led.sync_stream()
+    calls = {c["cli_call_id"]: c for c in led.entries("tool_call")}
+    w, s, f = calls["w1"], calls["s1"], calls["f1"]
+    assert w["output"] == 'Web search results for "q":\nPerez 2022 profiled 1.2 million PBMCs.'
+    assert w["output_from_cli_session"] and w["output_display"] == 'Search results for "q" returned.'
+    assert s["output"] == "a.txt b.txt" and "output_from_cli_session" not in s   # display is the result
+    assert f["output"] == "Successfully wrote x" and f["output_from_cli_session"]
+
+
+def test_gemini_summary_without_session_file_kept_and_flagged_at_run_end(tmp_path):
+    _w(tmp_path / "transcript.jsonl", [
+        {"type": "tool_use", "tool_name": "google_web_search", "tool_id": "w1", "parameters": {"query": "q"}},
+        {"type": "tool_result", "tool_id": "w1", "status": "success", "output": 'Search results for "q" returned.'}])
+    p = StreamParser(tmp_path / "transcript.jsonl")
+    assert p.read() == []
+    (c,) = p.read(final=True)
+    assert c["output"] == 'Search results for "q" returned.' and c["output_display_only"]
+
+
+def test_gemini_full_stream_result_kept_when_the_model_got_a_shortened_copy(tmp_path):
+    full = '{"articles": [' + ", ".join(f'"a{i}"' for i in range(3000)) + "]}"
+    _w(tmp_path / "transcript.jsonl", [
+        {"type": "tool_use", "tool_name": "mcp_tooluniverse_execute_tool", "tool_id": "m1", "parameters": {}},
+        {"type": "tool_result", "tool_id": "m1", "status": "success", "output": full}])
+    _gemini_session(tmp_path, [("m1", "mcp_tooluniverse_execute_tool",
+                                "Output too large. Showing first 8,000 and last 32,000 characters.\n" + full[:500])])
+    (c,) = StreamParser(tmp_path / "transcript.jsonl").read(final=True)
+    assert c["output"] == full and "output_from_cli_session" not in c

@@ -14,8 +14,12 @@ _LEDGER_TOOLS: frozenset[str] = frozenset({
     "log_analysis_step",
     "declare_done",
     "request_human_input",
+    "log_note",
 })
-_LEDGER_TOOL_COUNT = len(_LEDGER_TOOLS)   # 6 available ops
+_LEDGER_TOOL_COUNT = 6   # ops available to runs recorded before ledger.jsonl
+# Ledger runs record the tools that write: write_hypothesis, update_hypothesis, log_note,
+# request_human_input, declare_done (read_hypotheses and recent_tool_calls write nothing).
+_LEDGER_V2_TOOL_COUNT = 5
 _TOOLUNIVERSE_TOOL_COUNT = 600            # approximate; from Gao et al. 2025
 # OPERA's MCP servers. Gemini CLI names their tools 'mcp_<server>_<tool>'; with single underscores
 # the split is ambiguous, so the known server names are matched.
@@ -55,11 +59,14 @@ class RunMetrics:
     turn_count: int | None                     # number of model invocations (agent turns used)
     revisions_per_hypothesis: float | None     # belief_revision_count / hypothesis_count
     tool_diversity_entropy: float | None       # kept for backward compat (merged, unnormalized)
-    tool_diversity_entropy_ledger: float | None    # H / log2(6), ledger ops only
+    tool_diversity_entropy_ledger: float | None    # H / log2(ledger_tool_count), ledger ops only
     tool_diversity_entropy_universe: float | None  # H / log2(600), over universe_tool_counts
     # biomedical tool -> calls: execute_tool's target, or a ToolUniverse tool called directly
     universe_tool_counts: dict = field(default_factory=dict)
     cost_unpriced_models: list = field(default_factory=list)  # Gemini models left out of cost_usd
+    # Ledger operations the ledger entropy is normalised by: 6 for runs recorded before
+    # ledger.jsonl, 5 for ledger runs (the tools that write an entry).
+    ledger_tool_count: int = _LEDGER_TOOL_COUNT
 
 
 def _split_mcp_name(name: str) -> tuple[str | None, str]:
@@ -199,7 +206,7 @@ def _parse_cost_details(transcript_path: Path) -> tuple[float | None, list[str]]
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if event.get("type") != "result":
+        if not isinstance(event, dict) or event.get("type") != "result":
             continue
         if "total_cost_usd" in event:
             claude_costs[event.get("session_id")] = float(event["total_cost_usd"])
@@ -363,26 +370,43 @@ def analyze_run(run_dir: str) -> RunMetrics:
         for h_id, h in hypotheses.items()
     }
 
-    # Ledger run_log: authoritative counts for hypothesis-ledger tool calls
     tool_diversity: dict[str, int] = {}
-    if ws.run_log_path.exists():
-        for line in ws.run_log_path.read_text(encoding="utf-8").strip().splitlines():
-            if not line:
-                continue
-            try:
-                entry = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            tool = entry.get("tool", "unknown")
-            tool_diversity[tool] = tool_diversity.get(tool, 0) + 1
+    for entry in ws.read_run_log():
+        tool = entry.get("tool", "unknown")
+        tool_diversity[tool] = tool_diversity.get(tool, 0) + 1
 
-    # Transcript covers ALL MCP calls. Use it only for tools not already in the ledger.
-    # Transcript names use the 'mcp__<server>__<tool>' prefix; ledger uses bare names.
-    # Strip the prefix before the skip-if-exists check so they match correctly.
     transcript_path = ws.run_dir / "transcript.jsonl"
-    for tool, count in _parse_transcript(transcript_path).items():
-        if _bare_tool_name(tool) not in tool_diversity:
-            tool_diversity[tool] = count
+    if ws.is_ledger_run:
+        # Every other tool call is a tool_call entry; the ledger's own calls are the entries above.
+        calls = [(c.get("cli_tool") or c["tool"], c.get("arguments") or {})
+                 for c in ws.ledger.entries("tool_call")
+                 if c.get("error_type") != "tool_not_registered"]   # never ran
+        for name, _ in calls:
+            tool_diversity[name] = tool_diversity.get(name, 0) + 1
+        end = ws.ledger.run_info("end") or {}
+        cost_usd, unpriced = end.get("cost_usd"), end.get("cost_unpriced_models") or []
+        outcome = end.get("outcome") or {}
+        # Main-agent model responses: what both CLIs' turn caps count. Claude Code's num_turns
+        # (turns_total) is 31 for a run stopped at a cap of 30 but 47 for one that finished in 30
+        # responses, so it doesn't compare across runs.
+        turn_count = outcome.get("model_responses") or outcome.get("turns_total")
+        universe_counts: dict[str, int] = {}
+        for name, args in calls:
+            tool = _universe_tool(name, args)
+            if tool is not None:
+                universe_counts[tool] = universe_counts.get(tool, 0) + 1
+        ledger_tool_count = _LEDGER_V2_TOOL_COUNT
+    else:
+        # Transcript covers ALL MCP calls. Use it only for tools not already in the ledger.
+        # Transcript names use the 'mcp__<server>__<tool>' prefix; ledger uses bare names.
+        # Strip the prefix before the skip-if-exists check so they match correctly.
+        for tool, count in _parse_transcript(transcript_path).items():
+            if _bare_tool_name(tool) not in tool_diversity:
+                tool_diversity[tool] = count
+        universe_counts = _parse_universe_calls(transcript_path)
+        cost_usd, unpriced = _parse_cost_details(transcript_path)
+        turn_count = _parse_turn_count(transcript_path)
+        ledger_tool_count = _LEDGER_TOOL_COUNT
 
     sequences = [_confidence_sequence(h) for h in hypotheses.values()]
     martingale_score_val, martingale_n = _martingale_score(sequences)
@@ -393,11 +417,9 @@ def analyze_run(run_dir: str) -> RunMetrics:
         belief_revision_count / n_hypotheses if n_hypotheses > 0 else None
     )
 
-    # Entropy per tool layer: the ledger's six operations, and the ToolUniverse biomedical tools
+    # Entropy per tool layer: the ledger's operations, and the ToolUniverse biomedical tools
     # actually run (built-in harness tools and ToolUniverse discovery calls are in neither).
     ledger_counts = {k: v for k, v in tool_diversity.items() if k in _LEDGER_TOOLS}
-    universe_counts = _parse_universe_calls(transcript_path)
-    cost_usd, unpriced = _parse_cost_details(transcript_path)
 
     # Merged unnormalized entropy (kept for backward compat).
     total_calls = sum(tool_diversity.values())
@@ -417,17 +439,18 @@ def analyze_run(run_dir: str) -> RunMetrics:
         tool_diversity=tool_diversity,
         hypothesis_count=n_hypotheses,
         tool_call_count=data.get("tool_call_count", 0),
-        completed=ws.final_report_path.exists(),
+        completed=ws.has_final_report(),
         martingale_score=martingale_score_val,
         martingale_n=martingale_n,
         directional_flip_count=flip_count,
         cost_usd=cost_usd,
-        turn_count=_parse_turn_count(transcript_path),
+        turn_count=turn_count,
         revisions_per_hypothesis=revisions_per_hypothesis,
         tool_diversity_entropy=tool_diversity_entropy,
-        tool_diversity_entropy_ledger=_normalized_entropy(ledger_counts, _LEDGER_TOOL_COUNT),
+        tool_diversity_entropy_ledger=_normalized_entropy(ledger_counts, ledger_tool_count),
         tool_diversity_entropy_universe=_normalized_entropy(universe_counts, _TOOLUNIVERSE_TOOL_COUNT),
         universe_tool_counts=universe_counts,
+        ledger_tool_count=ledger_tool_count,
         cost_unpriced_models=unpriced,
     )
 
@@ -455,7 +478,7 @@ def print_report(metrics: RunMetrics) -> None:
     def _fmt_entropy(e: float | None) -> str:
         return f"{e:.3f}" if e is not None else "N/A"
 
-    print(f"Tool diversity H (ledger):    {_fmt_entropy(metrics.tool_diversity_entropy_ledger)}  (normalized, 6 ops available)")
+    print(f"Tool diversity H (ledger):    {_fmt_entropy(metrics.tool_diversity_entropy_ledger)}  (normalized, {metrics.ledger_tool_count} ops available)")
     print(f"Tool diversity H (universe):  {_fmt_entropy(metrics.tool_diversity_entropy_universe)}  (normalized, ~600 tools available)")
     print("\nModality coverage per hypothesis:")
     for h_id, sources in metrics.modality_coverage.items():

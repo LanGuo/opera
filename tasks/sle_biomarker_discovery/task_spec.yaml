@@ -3,8 +3,17 @@ goal: >
   Identify the top 3 cell-type-specific candidate biomarkers or therapeutic targets
   for systemic lupus erythematosus (SLE / lupus), supported by multi-modal evidence.
   Starting data: Perez et al. 2022 SLE PBMC cohort, accessible via the cellxgene_census
-  Python package (dataset ID: perez_2022, approximately 1.2 million cells, 162 donors —
-  SLE patients and healthy controls). The agent may discover and use additional datasets.
+  Python package (Census release 2025-11-08, dataset_id 218acb0f-9f2f-4f76-b90b-15a4b7c7f629;
+  1,263,676 cells from 261 donors: 162 SLE patients and 99 healthy controls). The agent may
+  discover and use additional datasets.
+hypothesis_attributes:
+  - name: gene
+    description: "HGNC symbol of the candidate biomarker or target"
+  - name: cell_type
+    description: "the cell type(s) the hypothesis is about"
+hypothesis_constraints:
+  - unique: [gene]
+    among: [active, supported, weakened]
 termination_criteria:
   min_hypotheses_with_multimodal_evidence: 3
   max_tool_calls: 200
@@ -16,6 +25,8 @@ rubric:
     label: "Scientific Novelty"
     scope: per_hypothesis
     scale: "1-5"
+    pass: evidence
+    inputs: [evidence, tool_outputs]
     guidance: >
       Is this gene/cell-type combination a well-known SLE association or genuinely novel?
       Does multi-modal evidence (DEG, GWAS, protein interaction, literature) strengthen
@@ -24,6 +35,8 @@ rubric:
     label: "Experimental Design Quality"
     scope: per_hypothesis
     scale: "1-5"
+    pass: evidence
+    inputs: [validation_plan, evidence]
     guidance: >
       Feasibility of proposed validation (realistic cell numbers, reagents, assays),
       specificity to the hypothesis, statistical power (cohort size and controls),
@@ -32,6 +45,8 @@ rubric:
     label: "Evidence Strength"
     scope: per_hypothesis
     scale: "1-5"
+    pass: evidence
+    inputs: [evidence, tool_outputs]
     guidance: >
       Quality and independence of evidence modalities. Are at least 2 independent
       sources (scRNA-seq DEG, GWAS, protein interaction, literature, drug database)
@@ -40,6 +55,8 @@ rubric:
     label: "Clinical/Translational Relevance"
     scope: per_hypothesis
     scale: "1-5"
+    pass: evidence
+    inputs: [evidence, tool_outputs]
     guidance: >
       Potential clinical impact if validated — relevant to SLE diagnosis, disease
       monitoring, or treatment. Is the target druggable or measurable in clinical
@@ -48,6 +65,8 @@ rubric:
     label: "Reasoning Quality"
     scope: overall
     scale: "1-5"
+    pass: reasoning
+    inputs: [rationales, confidence_trajectory, evidence, "conclusion?"]
     guidance: >
       Did the agent update beliefs appropriately on evidence, handle contradictory
       findings, and seek diverse modalities rather than cherry-picking confirming
@@ -56,6 +75,8 @@ rubric:
     label: "Overall Scientific Quality"
     scope: overall
     scale: "1-5"
+    pass: run
+    inputs: [evidence, "conclusion?", tool_calls, notes]
     guidance: >
       Overall scientific rigor and quality of the discovery run — appropriate
       statistical methods, multi-modal evidence integration, and depth of exploration.
@@ -63,6 +84,8 @@ rubric:
     label: "Worth Pursuing in Wet Lab"
     scope: overall
     scale: "yes/no/partial"
+    pass: run
+    inputs: [conclusion, validation_plan, evidence]
     guidance: >
       Would the top hypotheses be worth pursuing in a wet lab validation study?
       Consider feasibility, novelty, and clinical relevance together.

@@ -318,3 +318,16 @@ def test_save_button_starts_disabled():
 def test_left_panel_has_instruction_area():
     resp = client.get("/")
     assert 'id="step-instruction"' in resp.text
+
+
+def test_build_yaml_keeps_pass_and_inputs_for_the_judge():
+    import yaml as pyyaml
+    from reviewer.rubric import load_criteria
+    rubric = [{"id": "strength", "label": "Strength", "scope": "per_hypothesis", "scale": "1-5",
+               "guidance": "g", "pass": "evidence", "inputs": ["evidence", "tool_outputs"]},
+              {"id": "viz", "label": "Viz", "scope": "overall", "scale": "1-5", "guidance": "g",
+               "pass": "run", "inputs": [{"artifacts": "results/*.png"}]}]
+    spec = pyyaml.safe_load(_build_yaml(SaveRequest(**dict(SAVE_PAYLOAD, rubric_overrides=rubric))))
+    crits, warnings = load_criteria(spec)
+    assert warnings == [] and [(c.judge_pass, c.inputs, c.artifact_globs) for c in crits] == [
+        ("evidence", ["evidence", "tool_outputs"], []), ("run", ["artifacts"], ["results/*.png"])]

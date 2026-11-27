@@ -1,249 +1,418 @@
+"""MCP server: the agent's tools for writing to the run ledger (`ledger.jsonl`).
+
+The tools are the same for every task. What a hypothesis is made of (attributes) and any rules
+about hypotheses (constraints) come from the task, through the `run_info` entry the harness writes
+at the start of the run (or `task_spec.yaml` in the run directory when there is none).
+"""
+from __future__ import annotations
+
 import json
 import os
-import uuid
-from datetime import datetime, timezone
 from typing import Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from .workspace import Workspace
+from .ledger import (LIVE_STATUSES, NOTE_KINDS, RELATIONS, STATUSES, Ledger, LedgerError,
+                     link_source)
 
 mcp = FastMCP("hypothesis-ledger")
-_workspace: Optional[Workspace] = None
+_ledger: Optional[Ledger] = None
 
 
-def _get_ws() -> Workspace:
-    global _workspace
-    if _workspace is None:
-        run_dir = os.environ.get("EVAL_RUN_DIR", "/workspace/runs/run_001")
-        _workspace = Workspace(run_dir)
-    return _workspace
+def _get_ledger() -> Ledger:
+    global _ledger
+    if _ledger is None:
+        _ledger = Ledger(os.environ.get("EVAL_RUN_DIR", "/workspace/runs/run_001"))
+    return _ledger
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _reset_for_tests(run_dir) -> Ledger:
+    global _ledger
+    _ledger = Ledger(run_dir)
+    return _ledger
 
 
-# --- Tool implementations (also exposed as _tool_* for direct unit testing) ---
-
-def _tool_write_hypothesis(
-    cell_type: str,
-    candidate_gene: str,
-    claim: str,
-    evidence: list,
-    confidence: float,
-    open_questions: list,
-) -> str:
-    ws = _get_ws()
-    h_id = uuid.uuid4().hex[:6].upper()
-    entry = {
-        "hypothesis_id": h_id,
-        "cell_type": cell_type,
-        "candidate_gene": candidate_gene,
-        "claim": claim,
-        "evidence": evidence,
-        "confidence": confidence,
-        "open_questions": open_questions,
-        "status": "active",
-        "update_history": [],
-        "created_at": _now(),
-    }
-    count = ws.increment_tool_call_count()
-
-    def _add(data):
-        data["hypotheses"][h_id] = entry
-
-    ws.update_ledger(_add)
-    ws.log_run({"timestamp": _now(), "tool": "write_hypothesis",
-                "inputs": {"cell_type": cell_type, "candidate_gene": candidate_gene},
-                "result": {"hypothesis_id": h_id}, "tool_call_count": count})
-    return json.dumps({"hypothesis_id": h_id, "status": "recorded"})
+def _error(e: Exception) -> str:
+    return json.dumps({"status": "rejected", "error": str(e)})
 
 
-def _tool_read_hypotheses(status_filter: str = "active") -> str:
-    ws = _get_ws()
-    data = ws.read_ledger()
-    hyps = data["hypotheses"]
-    if status_filter != "all":
-        hyps = {k: v for k, v in hyps.items() if v["status"] == status_filter}
-    count = ws.increment_tool_call_count()
-    ws.log_run({"timestamp": _now(), "tool": "read_hypotheses",
-                "status_filter": status_filter, "tool_call_count": count})
-    return json.dumps({
-        "hypotheses": hyps,
-        "total_count": len(data["hypotheses"]),
-        "filtered_count": len(hyps),
-        "tool_call_count": count,
-    }, indent=2)
+# --- validation helpers ---
+
+def _confidence(x) -> float:
+    try:
+        c = float(x)
+    except (TypeError, ValueError):
+        raise LedgerError(f"confidence must be a number between 0 and 1, got {x!r}")
+    if not 0 <= c <= 1:
+        raise LedgerError(f"confidence must be between 0 and 1, got {c}")
+    return c
 
 
-def _tool_update_hypothesis(hypothesis_id: str, updates: dict, rationale: str) -> str:
-    ws = _get_ws()
-
-    def _update(data):
-        if hypothesis_id not in data["hypotheses"]:
-            raise ValueError(f"Hypothesis {hypothesis_id} not found")
-        h = data["hypotheses"][hypothesis_id]
-        old_values = {k: h.get(k) for k in updates}
-        h.update(updates)
-        h["update_history"].append({
-            "timestamp": _now(),
-            "rationale": rationale,
-            "changes": {"from": old_values, "to": updates},
-        })
-
-    ws.update_ledger(_update)
-    count = ws.increment_tool_call_count()
-    ws.log_run({"timestamp": _now(), "tool": "update_hypothesis",
-                "inputs": {"hypothesis_id": hypothesis_id, "updates": updates},
-                "result": {"status": "updated"}, "tool_call_count": count})
-    return json.dumps({"hypothesis_id": hypothesis_id, "status": "updated"})
+def _text(name: str, x) -> str:
+    if not isinstance(x, str) or not x.strip():
+        raise LedgerError(f"{name} is required and must be non-empty text")
+    return x.strip()
 
 
-def _tool_log_analysis_step(
-    step_type: str,
-    tool_used: str,
-    inputs_summary: str,
-    outputs_summary: str,
-    interpretation: str,
-    next_action: str,
-) -> str:
-    ws = _get_ws()
-    count = ws.increment_tool_call_count()
-    entry = {
-        "timestamp": _now(), "step_type": step_type, "tool_used": tool_used,
-        "inputs_summary": inputs_summary, "outputs_summary": outputs_summary,
-        "interpretation": interpretation, "next_action": next_action,
-        "tool_call_count": count,
-    }
-    ws.log_step(entry)
-    ws.log_run({"timestamp": _now(), "tool": "log_analysis_step",
-                "inputs": {"step_type": step_type, "tool_used": tool_used},
-                "result": {"logged": True}, "tool_call_count": count})
-    return json.dumps({"status": "logged", "step_count": count})
+def _str_list(name: str, x) -> list[str]:
+    if x is None:
+        return []
+    if isinstance(x, str):
+        return [x]
+    if not isinstance(x, list) or not all(isinstance(i, str) for i in x):
+        raise LedgerError(f"{name} must be a list of strings")
+    return list(x)
 
 
-def _tool_declare_done(
-    top_hypotheses: list,
-    rationale: str,
-    confidence_summary: str,
-    suggested_validation: str,
-) -> str:
-    ws = _get_ws()
-    data = ws.read_ledger()
-
-    # If the agent omitted hypothesis IDs, derive them deterministically: all
-    # non-refuted hypotheses sorted by confidence descending.
-    resolved_ids = list(top_hypotheses) if top_hypotheses else []
-    if not resolved_ids:
-        resolved_ids = sorted(
-            [h_id for h_id, h in data["hypotheses"].items()
-             if h.get("status") not in ("refuted",)],
-            key=lambda h_id: data["hypotheses"][h_id].get("confidence", 0),
-            reverse=True,
-        )
-
-    def _mark_terminal(d):
-        for h_id in resolved_ids:
-            if h_id in d["hypotheses"]:
-                d["hypotheses"][h_id]["status"] = "terminal"
-
-    ws.update_ledger(_mark_terminal)
-    data = ws.read_ledger()
-    terminal = [data["hypotheses"][h] for h in resolved_ids if h in data["hypotheses"]]
-    report = {
-        "completed_at": _now(),
-        "top_hypotheses": terminal,
-        "rationale": rationale,
-        "confidence_summary": confidence_summary,
-        "suggested_validation": suggested_validation,
-        "total_tool_calls": data.get("tool_call_count", 0),
-        "total_hypotheses_explored": len(data["hypotheses"]),
-    }
-    ws.write_final_report(report)
-    count = ws.increment_tool_call_count()
-    ws.log_run({"timestamp": _now(), "tool": "declare_done",
-                "inputs": {"top_hypotheses": resolved_ids},
-                "result": {"report_written": True}, "tool_call_count": count})
-    return json.dumps({
-        "status": "completed",
-        "report_path": str(ws.final_report_path),
-        "hypothesis_count": len(terminal),
-    })
+def _attributes(given, rules: dict) -> dict:
+    declared = {a["name"]: a for a in rules.get("hypothesis_attributes", [])}
+    given = given or {}
+    if not isinstance(given, dict):
+        raise LedgerError("attributes must be an object, e.g. {\"name\": \"value\"}")
+    if not declared:
+        if given:
+            raise LedgerError("this task declares no hypothesis attributes; pass attributes={} "
+                              "and put everything in the hypothesis text")
+        return {}
+    unknown = sorted(set(given) - set(declared))
+    if unknown:
+        raise LedgerError(f"unknown attribute(s) {unknown}; this task's attributes are "
+                          f"{sorted(declared)}")
+    missing = [n for n, a in declared.items() if a.get("required", True) and not str(given.get(n, "")).strip()]
+    if missing:
+        raise LedgerError(f"missing required attribute(s) {missing}; this task's attributes: " +
+                          "; ".join(f"{n}: {a.get('description', '')}".rstrip(": ") for n, a in declared.items()))
+    return {k: v for k, v in given.items()}
 
 
-def _tool_request_human_input(question: str, context: str) -> str:
-    ws = _get_ws()
+def _check_constraints(attributes: dict, rules: dict, ledger: Ledger) -> None:
+    for c in rules.get("hypothesis_constraints", []):
+        keys = c.get("unique")
+        if not keys:
+            continue
+        among = c.get("among") or list(LIVE_STATUSES)
+        mine = tuple(str(attributes.get(k, "")).strip().lower() for k in keys)
+        for hid, entries in ledger.hypotheses().items():
+            latest = entries[-1]
+            theirs = tuple(str(latest.get("attributes", {}).get(k, "")).strip().lower() for k in keys)
+            if theirs == mine and latest.get("status") in among:
+                shown = ", ".join(f"{k}={attributes.get(k)}" for k in keys)
+                raise LedgerError(
+                    f"{hid} is already a {latest['status']} hypothesis with {shown}; this task allows "
+                    f"one at a time. Update {hid} instead, or first mark it 'abandoned' with "
+                    f"update_hypothesis and then write the new one with derived_from=\"{hid}\".")
+
+
+def _evidence(items, hypothesis_id: str, ledger: Ledger, ids, prior: set[str]) -> tuple[list, list]:
+    """Validate and number evidence items, linking new ones to recorded tool calls."""
+    if isinstance(items, (dict, str)):
+        items = [items]
+    if not isinstance(items, list) or not items:
+        raise LedgerError("evidence is required: give at least one item — a new finding "
+                          "{finding, source, relation} or a reference to earlier evidence "
+                          "{ref: \"E3\", relation}")
+    known = ledger.evidence_items()
+    calls = list(ledger.tool_calls().values())
+    out, warnings = [], []
+    for n, item in enumerate(items, 1):
+        if isinstance(item, str):
+            item = {"finding": item}
+        if not isinstance(item, dict):
+            raise LedgerError(f"evidence item {n} must be an object")
+        relation = item.get("relation")
+        if relation not in RELATIONS:
+            raise LedgerError(f"evidence item {n}: relation must be one of {list(RELATIONS)} "
+                              f"(relative to this hypothesis), got {relation!r}")
+        if "ref" in item:
+            ref = item["ref"]
+            if ref not in known:
+                raise LedgerError(f"evidence item {n}: no evidence {ref!r} in the ledger")
+            out.append({"ref": ref, "relation": relation})
+            continue
+        finding = item.get("finding")
+        if not isinstance(finding, str) or not finding.strip():
+            raise LedgerError(f"evidence item {n}: 'finding' (a factual statement of the result) is required")
+        source = item.get("source") if isinstance(item.get("source"), dict) else {}
+        tool_call_ids, link, candidates, signals = link_source(source, calls, finding)
+        new = {"evidence_id": ids.next("E"), "finding": finding.strip(), "source": source,
+               "relation": relation, "tool_call_ids": tool_call_ids, "link": link,
+               "link_signals": signals}
+        if link == "probable":
+            new["link_candidates"] = candidates
+        q = item.get("quantities")
+        if q:
+            new["quantities"] = q if isinstance(q, list) else [q]
+        extra = {k: v for k, v in item.items()
+                 if k not in ("finding", "source", "relation", "quantities")}
+        if extra:
+            new["extra"] = extra
+        if link == "none":
+            warnings.append(f"{new['evidence_id']}: no recorded source — no tool call matched "
+                            f"source={json.dumps(source)}. Name the tool you called (e.g. Bash) and a "
+                            "short text from its arguments (e.g. the script name), or cite "
+                            "{\"tool_call_ids\": [...]} from recent_tool_calls. Until then it is "
+                            "shown to reviewers as 'no recorded source'")
+        out.append(new)
+    return out, warnings
+
+
+# --- tools ---
+
+def _tool_write_hypothesis(hypothesis, attributes, confidence, evidence, rationale,
+                           open_questions=None, derived_from=None) -> str:
+    led = _get_ledger()
+    try:
+        led.sync_stream()
+        rules = led.task_rules()
+        text = _text("hypothesis", hypothesis)
+        attrs = _attributes(attributes, rules)
+        conf = _confidence(confidence)
+        why = _text("rationale", rationale)
+        questions = _str_list("open_questions", open_questions)
+        if derived_from is not None and derived_from not in led.hypotheses():
+            raise LedgerError(f"derived_from: no hypothesis {derived_from!r}")
+        warnings: list[str] = []
+
+        def build(ids):
+            _check_constraints(attrs, rules, led)
+            items, w = _evidence(evidence, "", led, ids, set())
+            warnings.extend(w)
+            return [{"kind": "hypothesis", "action": "create", "hypothesis_id": ids.next("H"),
+                     "hypothesis": text, "attributes": attrs, "derived_from": derived_from,
+                     "confidence": conf, "status": "active", "evidence": items,
+                     "evidence_withdrawn": [], "rationale": why, "open_questions": questions}]
+
+        [entry] = led.transact(build, "agent")
+    except LedgerError as e:
+        return _error(e)
+    return json.dumps({"status": "recorded", "hypothesis_id": entry["hypothesis_id"],
+                       "entry_id": entry["entry_id"], "evidence": _evidence_summary(entry),
+                       "warnings": warnings})
+
+
+def _evidence_summary(entry: dict) -> list[dict]:
+    return [{k: i[k] for k in ("evidence_id", "link", "tool_call_ids") if k in i}
+            for i in entry["evidence"] if "evidence_id" in i]
+
+
+def _cited(entries: list[dict]) -> set[str]:
+    ids = set()
+    for e in entries:
+        for i in e.get("evidence", []):
+            ids.add(i.get("evidence_id") or i.get("ref"))
+    return ids
+
+
+def _tool_update_hypothesis(hypothesis_id, confidence, status, evidence, rationale,
+                            evidence_withdrawn=None, open_questions=None) -> str:
+    led = _get_ledger()
+    try:
+        led.sync_stream()
+        entries = led.hypotheses().get(hypothesis_id)
+        if not entries:
+            raise LedgerError(f"no hypothesis {hypothesis_id!r}; existing: {sorted(led.hypotheses())}")
+        conf = _confidence(confidence)
+        if status not in STATUSES:
+            raise LedgerError(f"status must be one of {list(STATUSES)}, got {status!r}")
+        why = _text("rationale", rationale)
+        withdrawn = _str_list("evidence_withdrawn", evidence_withdrawn)
+        cited = _cited(entries)
+        bad = [w for w in withdrawn if w not in cited]
+        if bad:
+            raise LedgerError(f"evidence_withdrawn: {bad} were never cited for {hypothesis_id}")
+        first, latest = entries[0], entries[-1]
+        questions = latest.get("open_questions", []) if open_questions is None else \
+            _str_list("open_questions", open_questions)
+        warnings: list[str] = []
+
+        def build(ids):
+            if status in LIVE_STATUSES and latest.get("status") not in LIVE_STATUSES:
+                _check_constraints(first.get("attributes", {}), led.task_rules(), led)
+            items, w = _evidence(evidence, hypothesis_id, led, ids, cited)
+            warnings.extend(w)
+            return [{"kind": "hypothesis", "action": "update", "hypothesis_id": hypothesis_id,
+                     "hypothesis": first["hypothesis"], "attributes": first.get("attributes", {}),
+                     "derived_from": first.get("derived_from"), "confidence": conf, "status": status,
+                     "evidence": items, "evidence_withdrawn": withdrawn, "rationale": why,
+                     "open_questions": questions}]
+
+        [entry] = led.transact(build, "agent")
+    except LedgerError as e:
+        return _error(e)
+    return json.dumps({"status": "recorded", "hypothesis_id": hypothesis_id,
+                       "entry_id": entry["entry_id"], "evidence": _evidence_summary(entry),
+                       "warnings": warnings})
+
+
+def _tool_read_hypotheses(status_filter: str = "live") -> str:
+    led = _get_ledger()
+    out = []
+    for hid, entries in led.hypotheses().items():
+        latest = entries[-1]
+        if status_filter == "live" and latest["status"] not in LIVE_STATUSES:
+            continue
+        if status_filter not in ("live", "all") and latest["status"] != status_filter:
+            continue
+        withdrawn = {w for e in entries for w in e.get("evidence_withdrawn", [])}
+        out.append({"hypothesis_id": hid, "hypothesis": latest["hypothesis"],
+                    "attributes": latest.get("attributes", {}), "derived_from": latest.get("derived_from"),
+                    "confidence": latest["confidence"], "status": latest["status"],
+                    "evidence_ids": sorted(_cited(entries) - withdrawn, key=lambda s: int(s[1:])),
+                    "evidence_withdrawn": sorted(withdrawn), "entries": len(entries),
+                    "open_questions": latest.get("open_questions", [])})
+    return json.dumps({"hypotheses": out, "total": len(led.hypotheses())}, indent=2)
+
+
+def _tool_recent_tool_calls(n: int = 10) -> str:
+    led = _get_ledger()
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return _error(LedgerError(f"n must be a whole number of calls (1-50), got {n!r}"))
+    led.sync_stream()
+    calls = list(led.tool_calls().values())[-max(1, min(n, 50)):]
+    return json.dumps([{"tool_call_id": c["tool_call_id"], "tool": c["tool"],
+                        "arguments": json.dumps(c.get("arguments"), ensure_ascii=False)[:200],
+                        "error": c.get("error"), "output": (c.get("output") or "")[:200]}
+                       for c in calls], indent=2)
+
+
+def _tool_log_note(kind, text, hypothesis_ids=None) -> str:
+    led = _get_ledger()
+    try:
+        if kind not in NOTE_KINDS:
+            raise LedgerError(f"kind must be one of {list(NOTE_KINDS)}, got {kind!r}")
+        body = _text("text", text)
+        hids = _str_list("hypothesis_ids", hypothesis_ids)
+        unknown = [h for h in hids if h not in led.hypotheses()]
+        if unknown:
+            raise LedgerError(f"hypothesis_ids: no hypothesis {unknown}")
+        [entry] = led.append([{"kind": "note", "note_kind": kind, "text": body,
+                               "hypothesis_ids": hids}], "agent")
+    except LedgerError as e:
+        return _error(e)
+    return json.dumps({"status": "recorded", "entry_id": entry["entry_id"]})
+
+
+def _tool_request_human_input(question, context) -> str:
+    led = _get_ledger()
     human_enabled = os.environ.get("ALLOW_HUMAN_INPUT", "false").lower() == "true"
-    ws.log_run({"timestamp": _now(), "tool": "request_human_input",
-                "inputs": {"question": question, "context": context},
-                "result": {"mode": "human" if human_enabled else "headless"}})
+    answer = None
+    if human_enabled:
+        print(f"\n[HUMAN INPUT]\nContext: {context}\nQuestion: {question}\nAnswer: ", flush=True)
+        answer = input()
+    [entry] = led.append([{"kind": "human_input", "question": question, "context": context,
+                           "mode": "human" if human_enabled else "headless", "answer": answer}], "agent")
     if not human_enabled:
-        return json.dumps({
-            "status": "headless_mode",
-            "message": "Human input requested but running headlessly. Question logged.",
-            "question": question,
-        })
-    print(f"\n[HUMAN INPUT]\nContext: {context}\nQuestion: {question}\nAnswer: ", flush=True)
-    return json.dumps({"status": "received", "answer": input()})
+        return json.dumps({"status": "headless_mode", "entry_id": entry["entry_id"],
+                           "message": "No human is available in this run; your question is recorded."})
+    return json.dumps({"status": "received", "answer": answer})
 
 
-# --- FastMCP tool registrations ---
+def _tool_declare_done(ranked_hypothesis_ids, rationale, confidence_summary, validation) -> str:
+    led = _get_ledger()
+    try:
+        ranked = _str_list("ranked_hypothesis_ids", ranked_hypothesis_ids)
+        if not ranked:
+            raise LedgerError("ranked_hypothesis_ids is required: your final hypotheses, best first")
+        known = led.hypotheses()
+        unknown = [h for h in ranked if h not in known]
+        if unknown:
+            raise LedgerError(f"ranked_hypothesis_ids: no hypothesis {unknown}")
+        why = _text("rationale", rationale)
+        warnings = []
+        if isinstance(validation, str):
+            validation = {"run": validation}
+            warnings.append("validation was one text for the run; give one plan per hypothesis "
+                            "({\"H1\": \"...\"}) so each is judged on its own plan")
+        if not isinstance(validation, dict):
+            raise LedgerError("validation must map hypothesis ids to a proposed validation experiment")
+        missing = [h for h in ranked if h not in validation]
+        if missing and "run" not in validation:
+            warnings.append(f"no validation plan for {missing}")
+        [entry] = led.append([{"kind": "conclusion", "ranked_hypothesis_ids": ranked, "rationale": why,
+                               "confidence_summary": confidence_summary, "validation": validation}],
+                             "agent")
+    except LedgerError as e:
+        return _error(e)
+    return json.dumps({"status": "completed", "entry_id": entry["entry_id"], "warnings": warnings})
+
+
+# --- FastMCP registrations ---
 
 @mcp.tool()
-def write_hypothesis(
-    cell_type: str,
-    candidate_gene: str,
-    claim: str,
-    evidence: list,
-    confidence: float,
-    open_questions: list,
-) -> str:
-    """Record a new candidate hypothesis with structured evidence in the ledger."""
-    return _tool_write_hypothesis(cell_type, candidate_gene, claim, evidence, confidence, open_questions)
+def write_hypothesis(hypothesis: str, attributes: dict, confidence: float, evidence: list[dict],
+                     rationale: str, open_questions: list[str] = [], derived_from: str = "") -> str:
+    """Record a new hypothesis. Its text and attributes can never be changed afterwards: to change
+    them, write a new hypothesis with derived_from set to the old id.
+
+    hypothesis: what you propose is true, in one or two sentences.
+    attributes: the fields this task asks for (see your task instructions); {} if none.
+    confidence: 0-1.
+    evidence: at least one item. A new item is {"finding": factual statement of what a result shows
+      (numbers, not interpretation), "source": {"tool": name of the tool you called, "match": short
+      text from that call's arguments, e.g. a script name} or {"citation": "PMID ..."}. Name the tool
+      you called (Bash, run_shell_command, a ToolUniverse tool), not a library used in your code.
+      "relation": "supports" |
+      "contradicts" | "context", "quantities": optional [{"name","value","unit"}]}. An earlier item
+      is {"ref": "E3", "relation": ...}.
+    rationale: why your confidence is what it is, given this evidence.
+    """
+    return _tool_write_hypothesis(hypothesis, attributes, confidence, evidence, rationale,
+                                  open_questions, derived_from or None)
 
 
 @mcp.tool()
-def read_hypotheses(status_filter: str = "active") -> str:
-    """Return ledger entries filtered by status ('active', 'weakened', 'refuted', 'terminal', 'all')."""
+def update_hypothesis(hypothesis_id: str, confidence: float, status: str, evidence: list[dict],
+                      rationale: str, evidence_withdrawn: list[str] = [],
+                      open_questions: list[str] = []) -> str:
+    """Record a change in belief about a hypothesis: new evidence, confidence, or status.
+
+    status: active | supported | weakened | refuted | abandoned.
+    evidence: at least one item — the new evidence that prompted this update, or references
+      ({"ref": "E3", "relation": ...}) to the earlier evidence this decision rests on. Same item format
+      as write_hypothesis.
+    rationale: why confidence and status are what they are now, given this evidence.
+    evidence_withdrawn: ids of earlier evidence you no longer rely on (say why in the rationale).
+    open_questions: the current list of open questions; leave empty to keep the previous list.
+    The hypothesis text and attributes can't be changed here; write a new hypothesis instead.
+    """
+    return _tool_update_hypothesis(hypothesis_id, confidence, status, evidence, rationale,
+                                   evidence_withdrawn, open_questions or None)
+
+
+@mcp.tool()
+def read_hypotheses(status_filter: str = "live") -> str:
+    """Current state of each hypothesis: 'live' (active, supported, weakened), 'all', or one status."""
     return _tool_read_hypotheses(status_filter)
 
 
 @mcp.tool()
-def update_hypothesis(hypothesis_id: str, updates: dict, rationale: str) -> str:
-    """Revise confidence, status, or evidence for a hypothesis. Rationale is required and logged."""
-    return _tool_update_hypothesis(hypothesis_id, updates, rationale)
+def recent_tool_calls(n: int = 10) -> str:
+    """The last n tool calls recorded in the ledger, with their ids (T1, T2, ...). Optional: cite
+    an id in an evidence source as {"tool_call_ids": ["T12"]}."""
+    return _tool_recent_tool_calls(n)
 
 
 @mcp.tool()
-def log_analysis_step(
-    step_type: str,
-    tool_used: str,
-    inputs_summary: str,
-    outputs_summary: str,
-    interpretation: str,
-    next_action: str,
-) -> str:
-    """Record a structured analysis step. Call after every non-trivial tool result."""
-    return _tool_log_analysis_step(step_type, tool_used, inputs_summary,
-                                   outputs_summary, interpretation, next_action)
-
-
-@mcp.tool()
-def declare_done(
-    top_hypotheses: list,
-    rationale: str,
-    confidence_summary: str,
-    suggested_validation: str,
-) -> str:
-    """Signal task complete. Writes final_report.json and marks top hypotheses as terminal."""
-    return _tool_declare_done(top_hypotheses, rationale, confidence_summary, suggested_validation)
+def log_note(kind: str, text: str, hypothesis_ids: list[str] = []) -> str:
+    """Record a note in the ledger. kind: interpretation (what a result means, linked to the
+    hypotheses it bears on) | plan | debug | other."""
+    return _tool_log_note(kind, text, hypothesis_ids)
 
 
 @mcp.tool()
 def request_human_input(question: str, context: str) -> str:
-    """Request human expert judgment. In headless mode (default), logs the question and returns immediately."""
+    """Ask a human expert. In headless runs the question is recorded and no answer comes back."""
     return _tool_request_human_input(question, context)
+
+
+@mcp.tool()
+def declare_done(ranked_hypothesis_ids: list[str], rationale: str, confidence_summary: str,
+                 validation: dict) -> str:
+    """Finish the task. ranked_hypothesis_ids: your final hypotheses, best first. validation: one
+    proposed validation experiment per ranked hypothesis, {"H1": "...", "H2": "..."}."""
+    return _tool_declare_done(ranked_hypothesis_ids, rationale, confidence_summary, validation)
 
 
 def run():

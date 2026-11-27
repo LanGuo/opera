@@ -3,9 +3,10 @@ import json
 import pytest
 
 from evaluator.harness import (
-    PILOT_GEMINI_PROMPT_TEMPLATE, PROFILES, TOOLUNIVERSE_SERVER, TOOLUNIVERSE_VERSION, plan_run,
-    prepare_run, summarize_transcript,
+    PILOT_GEMINI_PROMPT_TEMPLATE, PROFILES, TOOLUNIVERSE_SERVER, TOOLUNIVERSE_VERSION,
+    delivered_task_text, plan_run, prepare_run, summarize_transcript,
 )
+from hypothesis_ledger.ledger import Ledger
 
 
 @pytest.fixture
@@ -44,7 +45,7 @@ def test_pilot_claude_matches_run_eval_sh(setup):
         "claude", "--dangerously-skip-permissions", "--model", "claude-sonnet-4-6",
         "--max-turns", "30", "--output-format", "stream-json", "--verbose",
         # $(cat file) in bash strips trailing newlines
-        "--system-prompt", "TASK-BODY line 1\nline 2", "-p", "Begin the task.",
+        "--system-prompt", delivered_task_text(setup[1]).rstrip("\n"), "-p", "Begin the task.",
     ]
     assert p.env == {"EVAL_RUN_DIR": str(run_dir)} and p.unset_env == []
     assert p.files == {}
@@ -57,7 +58,7 @@ def test_pilot_gemini_matches_run_eval_sh(setup):
     assert p.argv == [
         "gemini", "--approval-mode", "yolo", "--skip-trust", "--model", "gemini-2.5-pro",
         "--output-format", "stream-json",
-        "-p", "Instruction: TASK-BODY line 1\nline 2\\n\\nBegin the task.",
+        "-p", "Instruction: " + delivered_task_text(setup[1]).rstrip("\n") + "\\n\\nBegin the task.",
     ]
     assert "--max-turns" not in p.argv  # the pilot Gemini runs had no turn cap
 
@@ -76,7 +77,7 @@ def test_matched_claude_isolates_and_appends(setup):
     assert p.argv[p.argv.index("--max-turns") + 1] == "30"
     task_file = p.argv[p.argv.index("--append-system-prompt-file") + 1]
     assert task_file == str(run_dir / "harness" / "agent_task.md")
-    assert p.files[run_dir / "harness" / "agent_task.md"] == "TASK-BODY line 1\nline 2\n\n"
+    assert p.files[run_dir / "harness" / "agent_task.md"] == delivered_task_text(setup[1])
     mcp = json.loads(p.files[run_dir / "harness" / "mcp.json"])["mcpServers"]
     assert set(mcp) == {"hypothesis-ledger", "tooluniverse"}
     assert mcp["hypothesis-ledger"]["args"][:3] == ["run", "--project", str(repo)]
@@ -91,7 +92,7 @@ def test_matched_gemini_isolates_appends_and_caps(setup):
     assert p.env["GEMINI_CLI_HOME"] == str(run_dir / "harness" / "gemini-home")
     assert p.env["GEMINI_CLI_TRUST_WORKSPACE"] == "true"
     assert p.argv[:3] == ["gemini", "-p", "Begin the task."]
-    assert p.files[ws / "GEMINI.md"] == "TASK-BODY line 1\nline 2\n\n"
+    assert p.files[ws / "GEMINI.md"] == delivered_task_text(setup[1])
     settings = json.loads(p.files[ws / ".gemini" / "settings.json"])
     assert settings["model"]["maxSessionTurns"] == 40
     assert set(settings["mcpServers"]) == {"hypothesis-ledger", "tooluniverse"}
@@ -124,15 +125,15 @@ def test_matched_configs_reference_tool_keys_without_writing_secrets(setup):
         assert tu["NCBI_API_KEY"] == "${NCBI_API_KEY}" and "BIOGRID_API_KEY" not in tu
 
 
-def test_matched_starts_pinned_tooluniverse_through_the_wrapper(setup):
+def test_matched_starts_pinned_tooluniverse_with_census(setup):
     _, _, run_dir = setup
     for model, path in (("claude-sonnet-4-6", run_dir / "harness" / "mcp.json"),
                         ("gemini-2.5-pro", run_dir / "workspace" / ".gemini" / "settings.json")):
         p = _plan(setup, "matched", model)
         tu = json.loads(p.files[path])["mcpServers"]["tooluniverse"]
         assert tu["command"] == "uvx"
-        assert tu["args"] == ["--from", f"tooluniverse=={TOOLUNIVERSE_VERSION}", "python", "-P",
-                              str(TOOLUNIVERSE_SERVER)]
+        assert tu["args"] == ["--python", "3.12", "--from", f"tooluniverse=={TOOLUNIVERSE_VERSION}",
+                              "--with", "cellxgene-census", "python", "-P", str(TOOLUNIVERSE_SERVER)]
         assert TOOLUNIVERSE_SERVER.is_file()
         assert p.details["tooluniverse"].startswith(TOOLUNIVERSE_VERSION)
 
@@ -228,8 +229,12 @@ def test_execute_runs_records_manifest_and_copies_rubric_after(setup):
     assert init["cwd"] == str(run_dir / "workspace")
     assert init["rubric_visible"] is False                 # not in the run dir during the run
     assert (run_dir / "task_spec.yaml").exists()           # copied in afterwards
-    saved = json.loads((run_dir / "run_manifest.json").read_text())
-    assert saved == m
+    assert not (run_dir / "run_manifest.json").exists()     # everything is in the ledger
+    led = Ledger(run_dir)
+    start, end = led.run_info("start"), led.run_info("end")
+    assert start["profile"] == "matched" and start["task_text"] == delivered_task_text(task_dir)
+    assert start["task_rules"] == {"hypothesis_attributes": [], "hypothesis_constraints": []}
+    assert end["exit_code"] == 0 and end["outcome"] == m["outcome"] and end["concluded"] is False
     assert m["profile"] == "matched" and m["harness"] == "claude" and m["exit_code"] == 0
     assert m["cli_version"] == "test-cli 1.0"
     assert m["task_sha256"] and len(m["task_sha256"]) == 64
@@ -319,11 +324,11 @@ def test_matched_claude_turns_off_subagents_and_background_tasks(setup):
     assert p.details["subagents"].startswith("off")
 
 
-def test_matched_gemini_excludes_subagent_tool(setup):
+def test_matched_gemini_excludes_subagent_and_narration_tools(setup):
     _, _, run_dir = setup
     p = _plan(setup, "matched", "gemini-2.5-pro")
     settings = json.loads(p.files[run_dir / "workspace" / ".gemini" / "settings.json"])
-    assert settings["tools"]["exclude"] == ["invoke_agent"]
+    assert settings["tools"]["exclude"] == ["invoke_agent", "update_topic"]
     assert p.stop_on_result is True
 
 

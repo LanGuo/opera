@@ -13,11 +13,18 @@ termination_criteria:
 evaluator:
   model: claude-opus-4-7
   max_turns: 200
+hypothesis_attributes:
+  - name: protein
+    description: "the protein whose fitness landscape the hypothesis is about"
+  - name: proposed_driver
+    description: "what drives synergy: active_site_proximity | physical_distance | other"
 rubric:
   - id: hypothesis_novelty
     label: "Hypothesis Novelty"
     scope: per_hypothesis
     scale: "1-5"
+    pass: evidence
+    inputs: [evidence, tool_outputs]
     guidance: >
       Is the proposed synergy driver (proximity to active site vs. physical distance)
       a well-known result or a finding that adds new understanding from this specific
@@ -26,6 +33,8 @@ rubric:
     label: "Evidence Strength"
     scope: per_hypothesis
     scale: "1-5"
+    pass: evidence
+    inputs: [evidence, tool_outputs]
     guidance: >
       Quality of evidence for the synergy hypothesis — appropriate statistical methods,
       adequate sample size from the fitness landscape, and reproducibility of the
@@ -34,6 +43,8 @@ rubric:
     label: "Visualization Correctness"
     scope: overall
     scale: "1-5"
+    pass: run
+    inputs: [{artifacts: "*.png"}, {artifacts: "*.py"}]
     guidance: >
       Check if activity heatmaps use sequential color scales and divergent scales
       only for relative changes (delta, synergy scores). Using a divergent scale
@@ -42,6 +53,8 @@ rubric:
     label: "Interview / Context-Loading Quality"
     scope: overall
     scale: "1-5"
+    pass: run
+    inputs: [human_input]
     guidance: >
       Did the agent ask at least 2 clarifying questions about the data schema or
       biological active site before performing analysis? This tests whether the
@@ -50,6 +63,8 @@ rubric:
     label: "Dataset Discovery"
     scope: overall
     scale: "yes/no/partial"
+    pass: run
+    inputs: [tool_calls, evidence, notes]
     guidance: >
       Did the agent autonomously find and cite a relevant protein fitness landscape
       dataset (e.g., GB1, GFP, or similar deep mutational scanning data) without
@@ -58,6 +73,8 @@ rubric:
     label: "Overall Scientific Quality"
     scope: overall
     scale: "1-5"
+    pass: run
+    inputs: [evidence, "conclusion?", tool_calls, {artifacts: "*.py"}]
     guidance: >
       Scientific rigor of the analysis including reproducibility (standalone script),
       appropriate statistical methods, depth of exploration across at least 3

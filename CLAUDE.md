@@ -13,7 +13,8 @@ uv run pytest -m "not integration"        # skip MCP integration tests
 
 ## Key Conventions
 
-- `hypothesis_ledger/workspace.py` — all run artifact I/O goes through `Workspace`
+- `hypothesis_ledger/ledger.py` — a run's only record is `ledger.jsonl` (append-only, locked appends); harness writes `run_info`/`tool_call`/`agent_message`/`artifact`, the agent's ledger tools write `hypothesis`/`note`/`human_input`/`conclusion`. Never add a separate log file
+- `hypothesis_ledger/workspace.py` — reviewer reads runs through `Workspace` (ledger.jsonl runs, and old ledger.json runs)
 - `reviewer/log_replay.py` — offline metrics; call `analyze_run(run_dir)` for `RunMetrics`
 - `reviewer/score.py` — LLM scoring; reads `task_spec.yaml` from run_dir to build rubric-driven prompts; two-pass scoring (evidence trail only → then agent rationale comparison); produces `CriterionScore` per rubric item; `score_run(run_dir, client)` for one backend, `score_run_all_backends(run_dir)` for all configured
 - `reviewer/review.py` — HTML generation; writes `review_<timestamp>.html` (never overwrites); renders per-criterion score table in blinded section; flags contested criteria (≥2 backends differ by ≥2 points)
@@ -25,7 +26,7 @@ uv run pytest -m "not integration"        # skip MCP integration tests
 1. Run `uv run bioagent-propose` (wizard generates `task_spec.yaml` + `agent_task.md` from plain-text description)
    — or hand-author `tasks/<task_id>/task_spec.yaml` with `rubric:` block (see `tasks/sle_biomarker_discovery/task_spec.yaml`)
 2. The `rubric:` list is the source of truth for scoring — same `guidance` text goes to LLM scorer and human reviewer HTML form
-   - Agent tasks must keep `evidence[].description` factual (observed data, numbers, sources) and `update_history[].rationale` interpretive (why confidence changed) — the scorer uses this separation for its two-pass design
+   - Declare what a hypothesis consists of with `hypothesis_attributes` (and rules such as one hypothesis per gene with `hypothesis_constraints`); the launcher turns these into the ledger section of the agent prompt, so `agent_task.md` should not describe the ledger tools
 3. Launch: `./scripts/run_eval.sh <model> <max_turns> <task_id>`
 
 ## Common Commands

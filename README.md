@@ -21,11 +21,9 @@ Three personas with clear responsibility boundaries and explicit artifact handof
 │  + agent_task.md             │        │  + MCP servers           │        │                          │
 └──────────────────────────┘        └──────────────────────────┘        └──────────────────────────┘
    task_spec.yaml                      runs/<run_id>/                      review_<timestamp>.html
-   agent_task.md                           ledger.json                         *_review.json
-                                       step_log.jsonl
-                                       final_report.json
-                                       transcript.jsonl
-                                       data/  results/
+   agent_task.md                           ledger.jsonl                        *_review.json
+                                       transcript.jsonl (raw CLI backup)
+                                       workspace/
 ```
 
 ---
@@ -38,15 +36,15 @@ Defines what the agent should investigate. Produces two artifacts per task:
 - `task_spec.yaml` — machine-readable config: goal, termination criteria, model, and a `rubric` list that drives both LLM scoring prompts and the human-reviewer HTML form
 - `agent_task.md` — agent-facing task prompt (goal-oriented; does not prescribe methodology); its "Success Criteria" section is consistent with the `rubric` items
 
-The agent never reads `task_spec.yaml`. `run_eval.sh` reads it for `model` and `max_turns`, then copies it into the run directory so the reviewer can read the rubric without needing the source repo.
+The agent never reads `task_spec.yaml`. The launcher (`evaluator/run.py`) appends a ledger section generated from its `hypothesis_attributes` and `hypothesis_constraints` to the agent's prompt, and copies the spec into the run directory so the reviewer can read the rubric without needing the source repo.
 
 ### Evaluator (`hypothesis_ledger/`, `scripts/`, `Dockerfile`)
 
-Runs the agent. Claude Code (headless) connects to two MCP servers:
-- `hypothesis-ledger`: custom MCP server for hypothesis state tracking (6 tools)
+Runs the agent (Claude Code or Gemini CLI, headless) with two MCP servers:
+- `hypothesis-ledger`: the agent's tools for recording hypotheses, notes and its conclusion (`write_hypothesis`, `update_hypothesis`, `read_hypotheses`, `recent_tool_calls`, `log_note`, `request_human_input`, `declare_done`)
 - `tooluniverse`: 600+ pre-built biomedical tools
 
-The agent reads `agent_task.md`, runs the task, and writes all artifacts to `runs/<run_id>/`.
+Each run has one record, `runs/<run_id>/ledger.jsonl`, an append-only file that is the only source of truth for the run (`hypothesis_ledger/ledger.py`). The launcher writes `run_info` entries (what ran; how it ended), a `tool_call` entry for every tool the agent uses (arguments and full output, copied live from the CLI's output stream), `agent_message` entries, and an `artifact` entry per workspace file at the end. The agent's ledger tools write `hypothesis` entries (creation and every update have the same fields, each with evidence and a rationale; the hypothesis text and attributes never change), `note`, `human_input` and `conclusion` entries. Evidence items are linked to the `tool_call` entries they came from when they are written. Runs recorded before `ledger.jsonl` can be converted with `python -m hypothesis_ledger.legacy <old_run> <out_dir>`.
 
 ### Reviewer (`reviewer/`)
 
@@ -65,19 +63,17 @@ Scores and presents the completed run:
 | Artifact | Path | Consumer |
 |---|---|---|
 | `agent_task.md` | `tasks/<task_id>/agent_task.md` | Claude Code agent (task prompt) |
-| `task_spec.yaml` | `tasks/<task_id>/task_spec.yaml` | `run_eval.sh` (model, max_turns); copied to run dir for reviewer |
+| `task_spec.yaml` | `tasks/<task_id>/task_spec.yaml` | `evaluator/run.py` (ledger section of the prompt); copied to run dir for reviewer |
 
 ### Evaluator → Reviewer
 
 | Artifact | Path | Consumer |
 |---|---|---|
 | `task_spec.yaml` | `runs/<run_id>/task_spec.yaml` | `score.py` (rubric-driven prompts), `review.py` (task context panel + rubric form) |
-| `ledger.json` | `runs/<run_id>/ledger.json` | `log_replay.py`, `score.py`, `review.py` |
-| `step_log.jsonl` | `runs/<run_id>/step_log.jsonl` | `review.py` |
-| `run_log.jsonl` | `runs/<run_id>/run_log.jsonl` | `log_replay.py` |
-| `final_report.json` | `runs/<run_id>/final_report.json` | `score.py`, `review.py` |
-| `transcript.jsonl` | `runs/<run_id>/transcript.jsonl` | `log_replay.py` (tool diversity) |
-| `data/`, `results/` | `runs/<run_id>/data/`, `.../results/` | `review.py` (supporting data) |
+| `ledger.jsonl` | `runs/<run_id>/ledger.jsonl` | `log_replay.py`, `score.py`, `review.py`, `falsification.py` (through `Workspace`) |
+| `transcript.jsonl` | `runs/<run_id>/transcript.jsonl` | none (raw CLI output, kept as a backup) |
+
+Runs recorded before `ledger.jsonl` have `ledger.json`, `step_log.jsonl`, `run_log.jsonl` and `final_report.json` instead; the reviewer still reads them.
 
 ### Reviewer → Archive
 
@@ -97,7 +93,7 @@ opera/
 │       ├── task_spec.yaml          # Task config (goal, termination criteria, model, rubric)
 │       └── agent_task.md               # Agent-facing task prompt
 ├── task_proposer/                  # LLM-assisted task authoring wizard (bioagent-propose CLI)
-├── hypothesis_ledger/              # Evaluator MCP server (6 hypothesis-tracking tools)
+├── hypothesis_ledger/              # Run ledger (ledger.jsonl) and the agent's ledger MCP server
 ├── reviewer/                       # Reviewer tools
 │   ├── log_replay.py               # Offline metrics (martingale score, flips, revisions, tool diversity)
 │   ├── falsification.py            # Observer LLM + e-value module for terminal hypothesis assessment
