@@ -1,4 +1,4 @@
-"""The ledger judge (judging-v2 §4): pass E, pass R, the run-level pass and reasoning scores.
+"""The ledger judge: pass E, pass R, the run-level pass and reasoning scores.
 
 Every input comes from ledger.jsonl through reviewer.judge_inputs; nothing is read from any other
 file of the run except task_spec.yaml (the rubric and goal). Passes are independent: pass R and the

@@ -1,4 +1,4 @@
-"""Task review step before any run (judging-v2 §4.2): does the agent prompt produce what the rubric reads?
+"""Task review step before any run: does the agent prompt produce what the rubric reads?
 
 For every rubric criterion: the pass that judges it, the ledger inputs it reads, which agent tool or
 harness step produces each, and whether the delivered agent prompt (agent_task.md plus the generated

@@ -9,7 +9,7 @@ Each criterion in a task spec's `rubric:` may declare
 
 Criteria without them get defaults (per-hypothesis → evidence pass, `reasoning_quality` →
 reasoning pass, other overall criteria → run pass) and a warning. Every input name maps to ledger
-entry kinds and fields (judging-v2 §4.2); the judge reads nothing else.
+entry kinds and fields; the judge reads nothing else.
 """
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ INPUTS = {
     "artifacts": ("artifact entries whose path matches the glob", "harness (workspace files)"),
 }
 
-# What each pass may read (judging-v2 §4.1). Pass E never reads the agent's interpretation.
+# What each pass may read. Pass E never reads the agent's interpretation.
 PASS_INPUTS = {
     "evidence": {"evidence", "tool_outputs", "open_questions", "validation_plan", "artifacts"},
     "reasoning": {"evidence", "tool_outputs", "rationales", "confidence_trajectory",

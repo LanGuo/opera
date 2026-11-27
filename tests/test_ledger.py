@@ -356,6 +356,10 @@ def test_recent_tool_calls_lists_ids(run):
     _w(run / "transcript.jsonl", claude_call("t1", "Bash", {"command": "ls"}, "out"))
     [c] = json.loads(server._tool_recent_tool_calls(5))
     assert c["tool_call_id"] == "T1" and c["tool"] == "Bash"
+    assert json.loads(server._tool_recent_tool_calls("3"))[0]["tool_call_id"] == "T1"
+    for bad in ("all", None):
+        r = json.loads(server._tool_recent_tool_calls(bad))
+        assert r["status"] == "rejected" and "whole number" in r["error"]
 
 
 # --- notes, human input, conclusion ---

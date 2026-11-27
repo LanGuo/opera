@@ -265,8 +265,12 @@ def _tool_read_hypotheses(status_filter: str = "live") -> str:
 
 def _tool_recent_tool_calls(n: int = 10) -> str:
     led = _get_ledger()
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return _error(LedgerError(f"n must be a whole number of calls (1-50), got {n!r}"))
     led.sync_stream()
-    calls = list(led.tool_calls().values())[-max(1, min(int(n), 50)):]
+    calls = list(led.tool_calls().values())[-max(1, min(n, 50)):]
     return json.dumps([{"tool_call_id": c["tool_call_id"], "tool": c["tool"],
                         "arguments": json.dumps(c.get("arguments"), ensure_ascii=False)[:200],
                         "error": c.get("error"), "output": (c.get("output") or "")[:200]}

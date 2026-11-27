@@ -1,4 +1,4 @@
-"""Judge inputs, selected and formatted from ledger.jsonl fields only (judging-v2 §4.1).
+"""Judge inputs, selected and formatted from ledger.jsonl fields only.
 
 Nothing here infers, summarises or rewords: each renderer prints named fields of named entry kinds
 in ledger order, with one fixed template for every agent. The only change to any value is the

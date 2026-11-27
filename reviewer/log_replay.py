@@ -59,11 +59,14 @@ class RunMetrics:
     turn_count: int | None                     # number of model invocations (agent turns used)
     revisions_per_hypothesis: float | None     # belief_revision_count / hypothesis_count
     tool_diversity_entropy: float | None       # kept for backward compat (merged, unnormalized)
-    tool_diversity_entropy_ledger: float | None    # H / log2(6), ledger ops only
+    tool_diversity_entropy_ledger: float | None    # H / log2(ledger_tool_count), ledger ops only
     tool_diversity_entropy_universe: float | None  # H / log2(600), over universe_tool_counts
     # biomedical tool -> calls: execute_tool's target, or a ToolUniverse tool called directly
     universe_tool_counts: dict = field(default_factory=dict)
     cost_unpriced_models: list = field(default_factory=list)  # Gemini models left out of cost_usd
+    # Ledger operations the ledger entropy is normalised by: 6 for runs recorded before
+    # ledger.jsonl, 5 for ledger runs (the tools that write an entry).
+    ledger_tool_count: int = _LEDGER_TOOL_COUNT
 
 
 def _split_mcp_name(name: str) -> tuple[str | None, str]:
@@ -414,7 +417,7 @@ def analyze_run(run_dir: str) -> RunMetrics:
         belief_revision_count / n_hypotheses if n_hypotheses > 0 else None
     )
 
-    # Entropy per tool layer: the ledger's six operations, and the ToolUniverse biomedical tools
+    # Entropy per tool layer: the ledger's operations, and the ToolUniverse biomedical tools
     # actually run (built-in harness tools and ToolUniverse discovery calls are in neither).
     ledger_counts = {k: v for k, v in tool_diversity.items() if k in _LEDGER_TOOLS}
 
@@ -447,6 +450,7 @@ def analyze_run(run_dir: str) -> RunMetrics:
         tool_diversity_entropy_ledger=_normalized_entropy(ledger_counts, ledger_tool_count),
         tool_diversity_entropy_universe=_normalized_entropy(universe_counts, _TOOLUNIVERSE_TOOL_COUNT),
         universe_tool_counts=universe_counts,
+        ledger_tool_count=ledger_tool_count,
         cost_unpriced_models=unpriced,
     )
 
@@ -474,7 +478,7 @@ def print_report(metrics: RunMetrics) -> None:
     def _fmt_entropy(e: float | None) -> str:
         return f"{e:.3f}" if e is not None else "N/A"
 
-    print(f"Tool diversity H (ledger):    {_fmt_entropy(metrics.tool_diversity_entropy_ledger)}  (normalized, 6 ops available)")
+    print(f"Tool diversity H (ledger):    {_fmt_entropy(metrics.tool_diversity_entropy_ledger)}  (normalized, {metrics.ledger_tool_count} ops available)")
     print(f"Tool diversity H (universe):  {_fmt_entropy(metrics.tool_diversity_entropy_universe)}  (normalized, ~600 tools available)")
     print("\nModality coverage per hypothesis:")
     for h_id, sources in metrics.modality_coverage.items():
