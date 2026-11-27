@@ -230,24 +230,24 @@ def test_anthropic_chat_raises_with_only_system_message(monkeypatch):
 
 def test_ollama_chat_returns_text():
     with patch("reviewer.llm._ollama") as mock_ollama:
-        mock_ollama.chat.return_value = {"message": {"content": "ollama says hi"}}
+        mock_ollama.Client.return_value.chat.return_value = {"message": {"content": "ollama says hi"}}
         c = LLMClient(backend="ollama", model="gemma4:e4b")
         assert c.chat([{"role": "user", "content": "hello"}]) == "ollama says hi"
 
 def test_ollama_chat_passes_schema():
     with patch("reviewer.llm._ollama") as mock_ollama:
-        mock_ollama.chat.return_value = {"message": {"content": "{}"}}
+        mock_ollama.Client.return_value.chat.return_value = {"message": {"content": "{}"}}
         c = LLMClient(backend="ollama", model="gemma4:e4b")
         schema = {"type": "object"}
         c.chat([{"role": "user", "content": "hi"}], schema=schema)
-    assert mock_ollama.chat.call_args[1]["format"] == schema
+    assert mock_ollama.Client.return_value.chat.call_args[1]["format"] == schema
 
 def test_ollama_chat_omits_format_when_no_schema():
     with patch("reviewer.llm._ollama") as mock_ollama:
-        mock_ollama.chat.return_value = {"message": {"content": "hi"}}
+        mock_ollama.Client.return_value.chat.return_value = {"message": {"content": "hi"}}
         c = LLMClient(backend="ollama", model="gemma4:e4b")
         c.chat([{"role": "user", "content": "hi"}])
-    assert "format" not in mock_ollama.chat.call_args[1]
+    assert "format" not in mock_ollama.Client.return_value.chat.call_args[1]
 
 
 # --- temperature and returned-model recording ---
@@ -312,11 +312,11 @@ def test_google_omits_temperature_by_default(monkeypatch):
 
 def test_ollama_passes_temperature_option():
     fake = MagicMock()
-    fake.chat.return_value = {"message": {"content": "ok"}, "model": "gemma4:e4b"}
+    fake.Client.return_value.chat.return_value = {"message": {"content": "ok"}, "model": "gemma4:e4b"}
     with patch("reviewer.llm._ollama", fake):
         c = LLMClient(backend="ollama", model="gemma4:e4b", temperature=0.0)
         assert c.chat([{"role": "user", "content": "x"}]) == "ok"
-    assert fake.chat.call_args.kwargs["options"] == {"temperature": 0.0}
+    assert fake.Client.return_value.chat.call_args.kwargs["options"] == {"temperature": 0.0}
     assert c.last_model == "gemma4:e4b"
 
 
@@ -324,3 +324,46 @@ def test_mock_client_reports_last_model():
     m = MockLLMClient("x")
     m.chat([{"role": "user", "content": "y"}])
     assert m.last_model == "mock"
+
+
+# --- request timeout (a Gemini request once hung for days: google-genai sets no timeout) ---
+
+import httpx
+from reviewer.llm import REQUEST_TIMEOUT_S
+
+
+def test_timeout_is_passed_to_every_backend(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("GOOGLE_API_KEY", "api-test")
+    assert REQUEST_TIMEOUT_S == 600.0
+    with patch("reviewer.llm._anthropic_sdk.Anthropic") as anth:
+        LLMClient(backend="anthropic", model="m")
+    assert anth.call_args.kwargs["timeout"] == 600.0
+    with patch("reviewer.llm._genai.Client") as gen:
+        LLMClient(backend="google", model="m", timeout=30)
+    assert gen.call_args.kwargs["http_options"].timeout == 30000      # milliseconds
+    with patch("reviewer.llm._ollama") as oll:
+        LLMClient(backend="ollama", model="m", timeout=45)
+    assert oll.Client.call_args.kwargs["timeout"] == 45
+
+
+def test_timed_out_google_request_is_retried(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "api-test")
+    c = LLMClient(backend="google", model="gemini-2.5-flash")
+    fake = MagicMock()
+    fake.models.generate_content.side_effect = [httpx.ReadTimeout("timed out"),
+                                                SimpleNamespace(text="ok", model_version="v")]
+    c._google_client = fake
+    with patch("reviewer.llm.time.sleep"):
+        assert c.chat([{"role": "user", "content": "x"}]) == "ok"
+    assert fake.models.generate_content.call_count == 2
+
+
+def test_google_request_that_keeps_timing_out_fails(monkeypatch):
+    monkeypatch.setenv("GOOGLE_API_KEY", "api-test")
+    c = LLMClient(backend="google", model="gemini-2.5-flash", max_retries=2)
+    fake = MagicMock()
+    fake.models.generate_content.side_effect = httpx.ReadTimeout("timed out")
+    c._google_client = fake
+    with patch("reviewer.llm.time.sleep"), pytest.raises(RuntimeError, match="after 2 attempts"):
+        c.chat([{"role": "user", "content": "x"}])

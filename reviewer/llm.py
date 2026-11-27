@@ -4,6 +4,7 @@ import re
 import time
 
 import anthropic as _anthropic_sdk
+import httpx
 
 try:
     import ollama as _ollama
@@ -17,6 +18,11 @@ except ImportError:
 
 
 _LEADING_FENCE = re.compile(r"^```(?:json)?\s*")
+
+# Seconds one request may take before it is abandoned and retried. Without it a Gemini request
+# can wait forever (google-genai sets no timeout; seen when a laptop slept mid-call). 600 s is the
+# Anthropic SDK's own default and leaves room for long Gemini Flash thinking.
+REQUEST_TIMEOUT_S = 600.0
 
 
 def extract_json_object(raw: str) -> dict:
@@ -48,7 +54,7 @@ class LLMClient:
 
     def __init__(
         self, backend: str, model: str, max_tokens: int = 4096, max_retries: int = 3,
-        temperature: float | None = None,
+        temperature: float | None = None, timeout: float = REQUEST_TIMEOUT_S,
     ):
         if backend not in ("anthropic", "google", "ollama"):
             raise ValueError(f"backend must be 'anthropic', 'google', or 'ollama', got {backend!r}")
@@ -63,19 +69,25 @@ class LLMClient:
         self._max_retries = max_retries
         # None leaves the provider's default sampling temperature in place.
         self.temperature = temperature
+        self.timeout = timeout
         # Model version the provider reports for the most recent response; an alias
         # like "gemini-2.5-flash" can resolve to different snapshots over time.
         self.last_model: str | None = None
         # Why the provider stopped (e.g. max_tokens / MAX_TOKENS when the answer was cut off).
         self.last_finish_reason: str | None = None
 
-        self._anthropic_client = _anthropic_sdk.Anthropic() if backend == "anthropic" else None
-        self._google_client = _genai.Client(api_key=os.environ.get("GOOGLE_API_KEY")) if backend == "google" else None
+        self._anthropic_client = _anthropic_sdk.Anthropic(timeout=timeout) if backend == "anthropic" else None
+        # google-genai takes its timeout in milliseconds.
+        self._google_client = _genai.Client(
+            api_key=os.environ.get("GOOGLE_API_KEY"),
+            http_options=_genai.types.HttpOptions(timeout=int(timeout * 1000))) if backend == "google" else None
+        self._ollama_client = _ollama.Client(timeout=timeout) if backend == "ollama" else None
 
     def chat(self, messages: list[dict], schema: dict | None = None) -> str:
         """Send messages and return response text.
 
         A leading role='system' item is extracted and passed as system kwarg for Anthropic/Google.
+        Each request may take `timeout` seconds; a timed-out request is retried like a dropped one.
         schema: optional JSON schema for constrained decoding (ollama/google).
         """
         last_exc: Exception | None = None
@@ -86,7 +98,8 @@ class LLMClient:
                 if self.backend == "google":
                     return self._chat_google(messages, schema)
                 return self._chat_ollama(messages, schema)
-            except (ConnectionError, TimeoutError, OSError) as exc:
+            except (ConnectionError, TimeoutError, OSError, httpx.TransportError) as exc:
+                # httpx.TransportError covers google-genai's and ollama's timeouts (httpx.ReadTimeout).
                 last_exc = exc
                 time.sleep(2 ** attempt)
             except _anthropic_sdk.APIConnectionError as exc:
@@ -155,13 +168,13 @@ class LLMClient:
         return resp.text
 
     def _chat_ollama(self, messages: list[dict], schema: dict | None) -> str:
-        assert _ollama is not None
+        assert self._ollama_client is not None
         kwargs: dict = dict(model=self.model, messages=messages)
         if schema is not None:
             kwargs["format"] = schema
         if self.temperature is not None:
             kwargs["options"] = {"temperature": self.temperature}
-        resp = _ollama.chat(**kwargs)
+        resp = self._ollama_client.chat(**kwargs)
         self.last_model = resp.get("model") or self.model
         return resp["message"]["content"]
 
