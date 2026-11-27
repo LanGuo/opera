@@ -300,6 +300,10 @@ def _observe(h_id: str, agent_conf, system: str, user: str, e_product: float,
     )
 
 
+# Hypothesis statuses the observer does not assess (D-65).
+SKIPPED_STATUSES = ("refuted", "abandoned")
+
+
 _P_QUANTITY = re.compile(r"^(p|p[_ -]?val(ue)?|padj|p[_ -]?adj(usted)?|fdr|q[_ -]?val(ue)?)$", re.IGNORECASE)
 
 
@@ -337,8 +341,9 @@ def assess_terminal_hypotheses(
     """Assess all hypotheses with evidence at end of run.
 
     Includes terminal, active, and weakened hypotheses — any hypothesis the
-    agent accumulated evidence for. Refuted hypotheses are excluded as the
-    agent already rejected them. The observer's validity is independent of
+    agent accumulated evidence for. Refuted and abandoned hypotheses are excluded:
+    the agent rejected them, or dropped or replaced them (an abandoned hypothesis's
+    confidence is often set to 0, so comparing the observer with it says nothing; D-65). The observer's validity is independent of
     whether the agent formally called declare_done on a hypothesis.
     """
     from hypothesis_ledger.workspace import Workspace
@@ -348,10 +353,10 @@ def assess_terminal_hypotheses(
         from reviewer.judge_inputs import build_run_view
         run = build_run_view(run_dir)
         return [assess_ledger_hypothesis(run, hid, c, prompt_variant) for hid, h in run.hypotheses.items()
-                if h.final.status != "refuted" and h.evidence]
+                if h.final.status not in SKIPPED_STATUSES and h.evidence]
     data = ws.read_ledger()
     to_assess = [
         h for h in data.get("hypotheses", {}).values()
-        if h.get("status") != "refuted" and evidence_for_judging(h)
+        if h.get("status") not in SKIPPED_STATUSES and evidence_for_judging(h)
     ]
     return [assess_hypothesis(h, c, prompt_variant) for h in to_assess]

@@ -237,7 +237,7 @@ def test_observer_reads_the_pass_e_input_and_quantities(run):
                                        "falsification_criteria": ["x"]}))
     results = assess_terminal_hypotheses(str(run), client)
     view = build_run_view(run)
-    expected = [hid for hid, h in view.hypotheses.items() if h.final.status != "refuted"]
+    expected = [hid for hid, h in view.hypotheses.items() if h.final.status not in ("refuted", "abandoned")]
     assert [r.hypothesis_id for r in results] == expected
     for r, messages in zip(results, client.calls):
         assert messages[-1]["content"] == render_evidence_input(view, r.hypothesis_id)
@@ -248,6 +248,24 @@ def test_observer_reads_the_pass_e_input_and_quantities(run):
     assert _ledger_item_e(item) == 10.0
     item.quantities = {"padj": 0.2}
     assert _ledger_item_e(item) == 0.5
+
+
+def test_observer_skips_abandoned_hypotheses(tmp_path):
+    from reviewer.falsification import assess_terminal_hypotheses
+    from reviewer.llm import MockLLMClient
+    from tests.synthetic_run import write_synthetic_run
+    run = write_synthetic_run(tmp_path / "r", concluded=True)
+    lines = (run / "ledger.jsonl").read_text().splitlines()
+    last = max(i for i, l in enumerate(lines)
+               if json.loads(l).get("kind") == "hypothesis" and json.loads(l)["hypothesis_id"] == "H3")
+    e = json.loads(lines[last])
+    e["status"], e["confidence"] = "abandoned", 0.0
+    lines[last] = json.dumps(e)
+    (run / "ledger.jsonl").write_text("\n".join(lines) + "\n")
+    client = MockLLMClient(json.dumps({"observer_confidence": 0.6, "evidence_assessments": [],
+                                       "falsification_criteria": ["x"]}))
+    ids = [r.hypothesis_id for r in assess_terminal_hypotheses(str(run), client)]
+    assert "H3" not in ids and "H1" in ids
 
 
 # --- review page ---------------------------------------------------------------------------------
