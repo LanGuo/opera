@@ -1,6 +1,7 @@
 """The run ledger (ledger.jsonl): recording, the agent's ledger tools, and readers."""
 import json
 import multiprocessing
+from pathlib import Path
 
 import pytest
 
@@ -402,6 +403,17 @@ def test_instructions_state_task_attributes_and_rule():
     assert "`gene` (required): HGNC symbol" in text and "at most one hypothesis per `gene`" in text
     assert "attributes={}" in ledger_instructions({})
     assert "log_analysis_step" not in text
+
+
+def test_instructions_describe_human_input_only_when_the_rubric_scores_it():
+    import yaml
+    root = Path(__file__).resolve().parent.parent / "tasks"
+    synergy = yaml.safe_load((root / "protein_synergy" / "task_spec.yaml").read_text())
+    sle = yaml.safe_load((root / "sle_biomarker_discovery" / "task_spec.yaml").read_text())
+    assert "`request_human_input`" in ledger_instructions(synergy)
+    assert "request_human_input" not in ledger_instructions(sle)
+    optional = {"rubric": [{"id": "x", "inputs": ["evidence", "human_input?"]}]}
+    assert "`request_human_input`" in ledger_instructions(optional)
 
 
 # --- readers ---

@@ -34,11 +34,26 @@ tool calls the harness records automatically (every tool you call and its full o
   summary, and one validation experiment per ranked hypothesis.
 """
 
+_HUMAN_INPUT = """\
+- **`request_human_input`** to ask the human expert a question (with the context it needs).
+  The question is recorded in the ledger whether or not anyone answers; if the reply says no
+  human is available, carry on with your own judgement.
+"""
+
+
+def _scores_human_input(spec: dict) -> bool:
+    """True if any rubric criterion reads the recorded human_input entries."""
+    for c in spec.get("rubric") or []:
+        for i in (c.get("inputs") if isinstance(c, dict) else None) or []:
+            if isinstance(i, str) and i.rstrip("?") == "human_input":
+                return True
+    return False
+
 
 def ledger_instructions(spec: dict | None, turn_budget: tuple[int, int] | None = None) -> str:
     """The ledger section for a task. turn_budget (cap, warn_at) adds the run's turn cap."""
     rules = task_rules_from_spec(spec or {})
-    lines = [_BASE]
+    lines = [_BASE + (_HUMAN_INPUT if _scores_human_input(spec or {}) else "")]
     if turn_budget:
         cap, warn_at = turn_budget
         lines.append(f"**Turn budget:** this run stops after {cap} turns; each of your responses "
