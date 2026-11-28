@@ -35,3 +35,12 @@ def test_prompt_that_asks_passes_and_confirm_appends(tmp_path):
     text = (t / "task_spec.yaml").read_text()
     assert text.startswith("# comment kept") and text.count(CONFIRM_KEY) == 1
     assert review(t)["confirmed"]["criteria_hash"] == r["criteria_hash"]
+
+
+def test_human_input_ask_must_be_in_the_task_text_and_may_wrap(tmp_path):
+    rubric = [{"id": "interview", "scope": "overall", "pass": "run", "inputs": ["human_input"]}]
+    wrapped = _task(tmp_path, "Before any analysis, ask the human expert at\nleast two probing questions.", rubric)
+    assert not review(wrapped)["problems"]
+    # The generated ledger section explains request_human_input but is not an ask by itself.
+    (tmp_path / "agent_task.md").write_text("Analyse the data.")
+    assert any(p.startswith("interview: needs human_input") for p in review(tmp_path)["problems"])

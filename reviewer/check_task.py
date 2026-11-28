@@ -26,11 +26,14 @@ from reviewer.rubric import INPUTS, RubricError, load_criteria
 # produced for every run (the harness records them, or the ledger tools require them).
 _ASKS = {
     "validation_plan": (r"validation", "declare_done must be asked for a validation experiment per hypothesis"),
-    "human_input": (r"request_human_input|clarif|ask .*question|questions? (to|for) the (user|human)",
+    "human_input": (r"request_human_input|clarif|ask\b[^.]*question|questions? (to|for) the (user|human)",
                     "nothing in the prompt asks the agent to ask questions (request_human_input)"),
     "notes": (r"log_note", "the prompt never mentions log_note"),
     "conclusion": (r"declare_done", "the prompt never mentions declare_done"),
 }
+# Inputs whose ask must come from agent_task.md itself: the generated ledger section explains the
+# tool but cannot say what the task wants asked.
+_TASK_TEXT_ONLY = {"human_input"}
 _ARTIFACT_HINTS = {".png": r"\.png|plot|figure|heatmap|visuali[sz]", ".py": r"\.py\b|script",
                    ".csv": r"\.csv|table", ".pdf": r"\.pdf|report"}
 CONFIRM_KEY = "judge_inputs_confirmed"
@@ -41,6 +44,7 @@ def review(task_dir) -> dict:
     spec = yaml.safe_load((task_dir / "task_spec.yaml").read_text(encoding="utf-8")) or {}
     criteria, warnings = load_criteria(spec)
     prompt = delivered_task_text(task_dir)
+    task_text = (task_dir / "agent_task.md").read_text(encoding="utf-8")
     rows, problems = [], []
     for c in criteria:
         row = {"id": c.id, "scope": c.scope, "pass": c.judge_pass, "inputs": [], "defaulted": c.defaulted}
@@ -49,7 +53,8 @@ def review(task_dir) -> dict:
             ok, why = True, ""
             if name in _ASKS:
                 pattern, why = _ASKS[name]
-                ok = re.search(pattern, prompt, re.IGNORECASE) is not None
+                ok = re.search(pattern, task_text if name in _TASK_TEXT_ONLY else prompt,
+                               re.IGNORECASE) is not None
             row["inputs"].append({"input": name, "ledger": source, "produced_by": producer,
                                   "prompt_asks": ok, "problem": "" if ok else why})
             if not ok:

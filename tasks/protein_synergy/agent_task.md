@@ -13,14 +13,14 @@ landscape, or similar deep mutational scanning data) using available tools.
 
 ## Required Behavior (The "Dos")
 
-1. **The Interview:** Before performing any analysis, call `request_human_input` 
-   with at least two probing questions about the data schema or biological 
-   context to "load the context into your head." Even in headless mode, this 
-   logs your intent.
+1. **The Interview:** Before performing any analysis, ask the human expert at 
+   least two probing questions about the data schema or biological context to 
+   "load the context into your head." Your questions are recorded even when 
+   nobody answers.
 
 2. **The Journal:** Maintain a `journal.md` in your workspace. Every time you 
    perform EDA or "stare at the data," record your observations, hypotheses, 
-   and changing beliefs. Use `log_note` (kind `interpretation`) to summarize these entries.
+   and changing beliefs. Summarize these entries as interpretation notes in the ledger.
 
 3. **Three Variations:** When visualizing synergy or distance correlations, 
    propose and implement at least **three distinct approaches** (e.g., 3D 
@@ -52,6 +52,6 @@ landscape, or similar deep mutational scanning data) using available tools.
 
 ## Success Criteria
 - A `journal.md` documenting the evolution of your understanding.
-- A final report via `declare_done` naming the top drivers of synergy.
+- A final ranked conclusion in the ledger naming the top drivers of synergy.
 - A `uv`-compatible script that reproduces your primary discovery plot.
 - Updated confidence scores in the ledger reflecting both structural and functional data.
